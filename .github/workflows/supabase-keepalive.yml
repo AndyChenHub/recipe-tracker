@@ -1,0 +1,19 @@
+name: Supabase Free-Tier Keepalive
+
+on:
+  schedule:
+    # Runs every 5 days at 04:00 UTC so the free-tier Supabase database never auto-pauses
+    - cron: '0 4 */5 * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    name: Ping Supabase REST Endpoint
+    runs-on: ubuntu-latest
+    if: ${{ secrets.EXPO_PUBLIC_SUPABASE_URL != '' && secrets.EXPO_PUBLIC_SUPABASE_ANON_KEY != '' }}
+    steps:
+      - name: Query recipes count
+        run: |
+          curl -fsSL "${{ secrets.EXPO_PUBLIC_SUPABASE_URL }}/rest/v1/recipes?select=id&limit=1" \
+            -H "apikey: ${{ secrets.EXPO_PUBLIC_SUPABASE_ANON_KEY }}" \
+            -H "Authorization: Bearer ${{ secrets.EXPO_PUBLIC_SUPABASE_ANON_KEY }}"

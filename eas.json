@@ -1,0 +1,43 @@
+{
+  "cli": {
+    "version": ">= 12.0.0",
+    "appVersionSource": "remote"
+  },
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal",
+      "env": {
+        "EAS_BUILD_PROFILE": "development"
+      },
+      "ios": {
+        "simulator": false
+      }
+    },
+    "adhoc": {
+      "distribution": "internal",
+      "autoIncrement": true,
+      "env": {
+        "EAS_BUILD_PROFILE": "adhoc"
+      },
+      "ios": {
+        "simulator": false
+      }
+    },
+    "production": {
+      "distribution": "store",
+      "autoIncrement": true,
+      "env": {
+        "EAS_BUILD_PROFILE": "production"
+      },
+      "ios": {
+        "simulator": false
+      }
+    }
+  },
+  "submit": {
+    "production": {
+      "ios": {}
+    }
+  }
+}
