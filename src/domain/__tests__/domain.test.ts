@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import { computeNextVersion } from '../../../scripts/bump-version.mjs';
+import { fetchTikTokContext, getDefaultCloudSettings, importRecipeUniversal } from '../../services/cloudSync';
 import { mergeRecipeIntoGroceryList } from '../grocery';
 import {
+  cleanWebVttTranscript,
   extractUrlFromSharedText,
+  linkIngredientsInStepText,
   parseRecipeFromCaptionOrText,
   parseRecipeFromHtmlJsonLd,
 } from '../importer';
@@ -59,11 +62,9 @@ describe('Dynamic Serving Scaler & Inline Step Renderer', () => {
     expect(formatKitchenNumber(1.5, 'tbsp')).toBe('1½');
 
     const tuscan = SAMPLE_RECIPES[0];
-    // Base is 4 servings; butter is 2 tbsp -> scaling to 8 servings = 4 tbsp = ¼ cup!
     const butterScaled = scaleIngredient(tuscan.ingredients[2], 4, 8, 'original');
     expect(butterScaled.formattedAmount).toBe('¼ cup');
 
-    // Non-scalable "Kosher salt and black pepper to taste" stays unchanged
     const saltScaled = scaleIngredient(tuscan.ingredients[9], 4, 10, 'original');
     expect(saltScaled.qtyMin).toBeNull();
     expect(saltScaled.formattedLine).toContain('to taste');
@@ -80,7 +81,6 @@ describe('Dynamic Serving Scaler & Inline Step Renderer', () => {
     );
 
     const ingTexts = segments.filter((s) => s.type === 'ingredient').map((s) => s.text);
-    // 1/2 cup broth -> 1 cup; 1 cup heavy cream -> 2 cups; 1/2 cup parmesan -> 1 cup
     expect(ingTexts).toEqual([
       '1 cup chicken broth',
       '2 cups heavy cream',
@@ -91,21 +91,28 @@ describe('Dynamic Serving Scaler & Inline Step Renderer', () => {
     expect(timerSeg).toEqual({ type: 'timer', seconds: 180, label: '3 mins' });
   });
 
-  it('auto-detects timers in plain-text steps', () => {
+  it('auto-detects timers and links inline ingredients inside plain-text steps', () => {
     const tokenized = autoTokenizeStepTimers('Bake at 180C for 25 minutes, then rest for 5 mins.');
     expect(tokenized).toContain('{{timer:1500|25 minutes}}');
     expect(tokenized).toContain('{{timer:300|5 mins}}');
+
+    const ings = [parseIngredientLine('2 tbsp butter', 0), parseIngredientLine('4 cloves garlic', 1)];
+    const linked = linkIngredientsInStepText(
+      'Melt 2 tbsp butter in a skillet and saute 4 cloves garlic for 2 minutes.',
+      ings
+    );
+    expect(linked).toContain('{{ing:0}}');
+    expect(linked).toContain('{{ing:1}}');
+    expect(linked).toContain('{{timer:120|2 minutes}}');
   });
 });
 
 describe('Smart Grocery Consolidation Engine', () => {
   it('consolidates overlapping canonical ingredients across scaled recipes and sorts by aisle', () => {
     const staples = getDefaultStapleIds().filter((id) => id !== 'butter' && id !== 'garlic');
-    // Tuscan Chicken (base 4 -> 4 servings): 1 cup heavy cream, 3 cups spinach, 2 tbsp butter, 4 cloves garlic
     let list = mergeRecipeIntoGroceryList([], SAMPLE_RECIPES[0], 4, {
       excludeCanonicalIds: staples,
     });
-    // Garlic Lemon Shrimp (base 2 -> 4 servings = 2x): 4 cups spinach, 6 tbsp butter, 8 cloves garlic
     list = mergeRecipeIntoGroceryList(list, SAMPLE_RECIPES[2], 4, {
       excludeCanonicalIds: staples,
     });
@@ -119,11 +126,9 @@ describe('Smart Grocery Consolidation Engine', () => {
     expect(spinach?.totalQty).toBe(7);
     expect(spinach?.formattedAmount).toBe('7 cups');
 
-    // 2 tbsp butter + 6 tbsp butter = 8 tbsp = ½ cup!
     const butter = list.find((i) => i.canonicalIngredientId === 'butter');
     expect(butter?.formattedAmount).toBe('½ cup');
 
-    // Produce items appear before Dairy & Eggs in aisle order
     const produceIdx = list.findIndex((i) => i.aisle === 'Produce');
     const dairyIdx = list.findIndex((i) => i.aisle === 'Dairy & Eggs');
     expect(produceIdx).toBeLessThan(dairyIdx);
@@ -133,9 +138,6 @@ describe('Smart Grocery Consolidation Engine', () => {
 describe('Stateless Temporary Pantry / Fridge Matcher', () => {
   it('ranks recipes by most entered items matched, then fewest missing required items', () => {
     const staples = getDefaultStapleIds();
-
-    // User enters shrimp, lemon, spinach -> Garlic Lemon Shrimp needs 0 extra items (ready_now!)
-    // while Tuscan Chicken only matches spinach (needs chicken, sun-dried tomato, broth, cream, parmesan)
     const matches = matchRecipesByTemporaryIngredients(
       SAMPLE_RECIPES,
       ['shrimp', 'lemon', 'spinach'],
@@ -159,7 +161,7 @@ describe('Stateless Temporary Pantry / Fridge Matcher', () => {
 
     expect(matches[0].recipe.id).toBe('sample-tuscan-chicken');
     expect(matches[0].matchedInputIds).toHaveLength(4);
-    expect(matches[0].tier).toBe('almost_there'); // Only missing sun-dried-tomato & chicken-broth
+    expect(matches[0].tier).toBe('almost_there');
     expect(matches[0].missingRequiredIngredients.map((i) => i.canonicalIngredientId)).toEqual([
       'sun-dried-tomato',
       'chicken-broth',
@@ -167,7 +169,7 @@ describe('Stateless Temporary Pantry / Fridge Matcher', () => {
   });
 });
 
-describe('Social Media & Web Recipe Importer', () => {
+describe('Social Media, TikTok & Web Recipe Importer', () => {
   it('cleans messy Share Sheet text and parses schema.org/Recipe JSON-LD', () => {
     const url = extractUrlFromSharedText(
       'Make this tonight!! https://www.tiktok.com/@chef/video/987654321?is_from_webapp=1 #pasta'
@@ -201,26 +203,76 @@ describe('Social Media & Web Recipe Importer', () => {
     expect(recipe?.steps[0].tokenizedText).toContain('{{timer:180|3 minutes}}');
   });
 
-  it('parses TikTok/Instagram captions into structured ingredients and steps', () => {
-    const caption = `
-Honey Soy Glazed Salmon
-Ingredients:
-2 salmon fillets
-2 tbsp soy sauce
-1 tbsp honey
-2 cloves garlic, minced
-Instructions:
-1. Sear salmon skin-side down for 4 minutes.
-2. Add garlic, soy sauce, and honey and baste for 2 minutes.
-    `;
-    const parsed = parseRecipeFromCaptionOrText(caption, {
-      sourceUrl: 'https://www.instagram.com/reel/abc123/',
+  it('parses TikTok inline-bullet captions with Unicode line separators and hashtags', () => {
+    const tiktokCaption =
+      'One-Pan Penne Alfredo - 30 min!\u2028INGREDIENTS: • 2 tbsp olive oil • 1/2 yellow onion, finely diced • 4 garlic cloves, minced • 1/4 cup white wine • 2 1/2 cups chicken broth • 1/2 cup heavy cream\u20281. Heat 2 tbsp olive oil and saute onion and garlic for 2 minutes.\u20282. Add chicken broth and heavy cream and simmer for 12 minutes. #pastarecipe #tiktokfood #easyrecipe';
+
+    const parsed = parseRecipeFromCaptionOrText(tiktokCaption, {
+      sourceUrl: 'https://www.tiktok.com/@chef/video/7566434572934644236',
     });
-    expect(parsed.title).toBe('Honey Soy Glazed Salmon');
-    expect(parsed.sourcePlatform).toBe('instagram');
-    expect(parsed.ingredients).toHaveLength(4);
-    expect(parsed.steps[0].tokenizedText).toContain('{{timer:240|4 minutes}}');
+
+    expect(parsed.title).toBe('One-Pan Penne Alfredo - 30 min!');
+    expect(parsed.sourcePlatform).toBe('tiktok');
+    expect(parsed.ingredients.length).toBe(6);
+    expect(parsed.ingredients.map((i) => i.canonicalIngredientId)).toContain('olive-oil');
+    expect(parsed.ingredients.map((i) => i.canonicalIngredientId)).toContain('heavy-cream');
+    expect(parsed.steps.length).toBe(2);
+    expect(parsed.steps[0].rawText).not.toContain('#pastarecipe');
+    expect(parsed.steps[1].tokenizedText).toContain('{{timer:720|12 minutes}}');
   });
+
+  it('cleans WebVTT subtitle files and extracts recipes from spoken TikTok transcripts', () => {
+    const sampleVtt = `WEBVTT
+
+1
+00:00:00.000 --> 00:00:03.500
+Start by searing two chicken breasts in one tablespoon of olive oil for 5 minutes per side.
+
+2
+00:00:03.500 --> 00:00:08.000
+Add four cloves of minced garlic, one cup of heavy cream, and half a cup of parmesan cheese, then simmer for 3 minutes.`;
+
+    const cleanTranscript = cleanWebVttTranscript(sampleVtt);
+    expect(cleanTranscript).not.toContain('WEBVTT');
+    expect(cleanTranscript).not.toContain('-->');
+
+    const parsed = parseRecipeFromCaptionOrText('Creamy Garlic Chicken #foodtiktok #dinner', {
+      sourceUrl: 'https://www.tiktok.com/@cook/video/7111111111111111111',
+      transcript: cleanTranscript,
+    });
+
+    expect(parsed.title).toBe('Creamy Garlic Chicken');
+    expect(parsed.ingredients.length).toBeGreaterThanOrEqual(4);
+    const canonicalIds = parsed.ingredients.map((i) => i.canonicalIngredientId);
+    expect(canonicalIds).toContain('chicken-breast');
+    expect(canonicalIds).toContain('olive-oil');
+    expect(canonicalIds).toContain('garlic');
+    expect(canonicalIds).toContain('heavy-cream');
+    expect(parsed.steps.length).toBe(2);
+    expect(parsed.steps[0].tokenizedText).toContain('{{timer:300|5 minutes}}');
+  });
+
+  it('extracts live TikTok URLs (spoken WebVTT subtitles + TikTok Notes recipes) end-to-end', async () => {
+    const settings = getDefaultCloudSettings();
+
+    // 1. Live TikTok video with spoken WebVTT subtitles (@hankgreen1)
+    const ttContext = await fetchTikTokContext(
+      'https://www.tiktok.com/@hankgreen1/video/7047596209028074758'
+    );
+    expect(ttContext.author).toBe('@hankgreen1');
+    expect(ttContext.transcript.length).toBeGreaterThan(50);
+    expect(ttContext.thumbnailUrl).toBeTruthy();
+
+    // 2. Live TikTok Notes recipe post (@niqq_xo Creamy Chicken Alfredo)
+    const imported = await importRecipeUniversal(
+      'https://notes.tiktok.com/@niqq_xo/7689617153183564319',
+      settings
+    );
+    expect(imported.recipe.title).toContain('Chicken Alfredo');
+    expect(imported.recipe.sourcePlatform).toBe('tiktok');
+    expect(imported.recipe.ingredients.length).toBeGreaterThanOrEqual(4);
+    expect(imported.recipe.steps.length).toBeGreaterThanOrEqual(2);
+  }, 20000);
 });
 
 describe('Semantic Version Release Helper', () => {

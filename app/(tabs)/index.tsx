@@ -44,6 +44,7 @@ export default function PaprikaRecipesScreen() {
   const [sortMode, setSortMode] = useState<SortMode>('name');
   const [viewMode, setViewMode] = useState<ViewMode>('list');
   const [categorySheetOpen, setCategorySheetOpen] = useState(false);
+  const [addMenuOpen, setAddMenuOpen] = useState(false);
 
   const categoryCounts = useMemo(() => {
     const counts = new Map<string, number>();
@@ -113,18 +114,19 @@ export default function PaprikaRecipesScreen() {
 
   return (
     <View style={[styles.screen, { backgroundColor: palette.paperBg }]}>
-      {/* Paprika 3 Navigation Bar: Sort on left, Tappable Category Dropdown in center, + on right */}
+      {/* Paprika 3 Navigation Bar: Sort on left, Tappable Category Dropdown in center, ＋ Menu on right */}
       <Tabs.Screen
         options={{
           headerLeft: () => (
-            <Pressable onPress={cycleSort} style={styles.headerSideBtn}>
+            <Pressable onPress={cycleSort} style={styles.headerSideBtn} hitSlop={8}>
               <Text style={styles.headerBtnText}>{sortLabel}</Text>
             </Pressable>
           ),
           headerTitle: () => (
             <Pressable
               onPress={() => setCategorySheetOpen(true)}
-              style={styles.headerTitleDropdown}>
+              style={styles.headerTitleDropdown}
+              hitSlop={8}>
               <Text numberOfLines={1} style={styles.headerTitleText}>
                 {selectedCategory} ▾
               </Text>
@@ -132,8 +134,9 @@ export default function PaprikaRecipesScreen() {
           ),
           headerRight: () => (
             <Pressable
-              onPress={() => router.push('/(tabs)/import')}
-              style={styles.headerSideBtn}>
+              onPress={() => setAddMenuOpen(true)}
+              style={styles.headerSideBtn}
+              hitSlop={10}>
               <Text style={styles.headerPlusText}>＋</Text>
             </Pressable>
           ),
@@ -208,7 +211,8 @@ export default function PaprikaRecipesScreen() {
             <View style={styles.emptyWrap}>
               <Text style={[styles.emptyTitle, { color: palette.text }]}>No Recipes Found</Text>
               <Text style={[styles.emptySub, { color: palette.textSecondary }]}>
-                Tap ＋ in the top-right corner or share directly from TikTok, Instagram, or Safari.
+                Tap ＋ in the top-right corner to create a recipe manually, scan a cookbook page, or
+                import from TikTok / Instagram.
               </Text>
             </View>
           }
@@ -219,7 +223,12 @@ export default function PaprikaRecipesScreen() {
                 styles.listRow,
                 { backgroundColor: pressed ? palette.bandBg : palette.paperBg },
               ]}>
-              <RecipeThumbnail imageUrl={item.imageUrl} title={item.title} size={56} borderRadius={5} />
+              <RecipeThumbnail
+                imageUrl={item.imageUrl}
+                title={item.title}
+                size={56}
+                borderRadius={5}
+              />
 
               <View style={styles.rowBody}>
                 <Text numberOfLines={1} style={[styles.rowTitle, { color: palette.text }]}>
@@ -279,6 +288,99 @@ export default function PaprikaRecipesScreen() {
           )}
         />
       )}
+
+      {/* Paprika "+" Add Recipe Action Menu */}
+      <Modal
+        visible={addMenuOpen}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setAddMenuOpen(false)}>
+        <Pressable style={styles.backdrop} onPress={() => setAddMenuOpen(false)}>
+          <Pressable
+            onPress={(e) => e.stopPropagation()}
+            style={[
+              styles.addMenuCard,
+              { backgroundColor: palette.paperBg, borderColor: palette.hairline },
+            ]}>
+            <View style={[styles.addMenuHeader, { borderBottomColor: palette.hairline }]}>
+              <Text style={[styles.addMenuTitle, { color: palette.text }]}>Add Recipe</Text>
+              <Pressable onPress={() => setAddMenuOpen(false)}>
+                <Text style={{ color: palette.paprika, fontWeight: '600', fontSize: 15 }}>
+                  Cancel
+                </Text>
+              </Pressable>
+            </View>
+
+            <Pressable
+              onPress={() => {
+                setAddMenuOpen(false);
+                router.push('/editor');
+              }}
+              style={[styles.addMenuItem, { borderBottomColor: palette.hairline }]}>
+              <Text style={styles.addMenuEmoji}>✏️</Text>
+              <View style={{ flex: 1 }}>
+                <Text style={[styles.addMenuItemTitle, { color: palette.text }]}>
+                  Add Recipe Manually
+                </Text>
+                <Text style={[styles.addMenuItemSub, { color: palette.textSecondary }]}>
+                  Type your own title, ingredients, and directions
+                </Text>
+              </View>
+            </Pressable>
+
+            <Pressable
+              onPress={() => {
+                setAddMenuOpen(false);
+                router.push({ pathname: '/editor', params: { scan: 'camera' } });
+              }}
+              style={[styles.addMenuItem, { borderBottomColor: palette.hairline }]}>
+              <Text style={styles.addMenuEmoji}>📷</Text>
+              <View style={{ flex: 1 }}>
+                <Text style={[styles.addMenuItemTitle, { color: palette.text }]}>
+                  Scan Cookbook Page (Camera)
+                </Text>
+                <Text style={[styles.addMenuItemSub, { color: palette.textSecondary }]}>
+                  Take a photo of a physical recipe page or card
+                </Text>
+              </View>
+            </Pressable>
+
+            <Pressable
+              onPress={() => {
+                setAddMenuOpen(false);
+                router.push({ pathname: '/editor', params: { scan: 'library' } });
+              }}
+              style={[styles.addMenuItem, { borderBottomColor: palette.hairline }]}>
+              <Text style={styles.addMenuEmoji}>🖼</Text>
+              <View style={{ flex: 1 }}>
+                <Text style={[styles.addMenuItemTitle, { color: palette.text }]}>
+                  Scan Screenshot or Photo
+                </Text>
+                <Text style={[styles.addMenuItemSub, { color: palette.textSecondary }]}>
+                  Extract a recipe from your Photo Library
+                </Text>
+              </View>
+            </Pressable>
+
+            <Pressable
+              onPress={() => {
+                setAddMenuOpen(false);
+                router.push('/(tabs)/import');
+              }}
+              style={styles.addMenuItem}>
+              <Text style={styles.addMenuEmoji}>🔗</Text>
+              <View style={{ flex: 1 }}>
+                <Text style={[styles.addMenuItemTitle, { color: palette.text }]}>
+                  Import from TikTok, Instagram, or Web URL
+                </Text>
+                <Text style={[styles.addMenuItemSub, { color: palette.textSecondary }]}>
+                  Paste a video link, food blog URL, or caption
+                </Text>
+              </View>
+            </Pressable>
+          </Pressable>
+        </Pressable>
+      </Modal>
 
       {/* Paprika Categories Drawer Modal */}
       <Modal
@@ -486,6 +588,52 @@ const styles = StyleSheet.create({
     fontSize: 14,
     textAlign: 'center',
     lineHeight: 20,
+  },
+  backdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.42)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 20,
+  },
+  addMenuCard: {
+    width: '100%',
+    maxWidth: 370,
+    borderRadius: 12,
+    borderWidth: StyleSheet.hairlineWidth,
+    overflow: 'hidden',
+  },
+  addMenuHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingHorizontal: 16,
+    paddingVertical: 13,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+  },
+  addMenuTitle: {
+    fontSize: 16,
+    fontWeight: '700',
+  },
+  addMenuItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 16,
+    paddingVertical: 13,
+    gap: 12,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: 'transparent',
+  },
+  addMenuEmoji: {
+    fontSize: 22,
+  },
+  addMenuItemTitle: {
+    fontSize: 15,
+    fontWeight: '600',
+  },
+  addMenuItemSub: {
+    fontSize: 12,
+    marginTop: 2,
   },
   modalScreen: {
     flex: 1,

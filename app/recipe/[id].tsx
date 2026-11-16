@@ -253,6 +253,11 @@ export default function PaprikaRecipeDetailScreen() {
           headerTintColor: palette.headerText,
           headerRight: () => (
             <View style={styles.headerIcons}>
+              <Pressable
+                onPress={() => router.push(`/editor?id=${recipe.id}` as never)}
+                hitSlop={8}>
+                <Text style={styles.headerEditText}>Edit</Text>
+              </Pressable>
               <Pressable onPress={() => toggleFavorite(recipe.id)} hitSlop={8}>
                 <Text style={styles.headerIconText}>{recipe.isFavorite ? '♥' : '♡'}</Text>
               </Pressable>
@@ -607,6 +612,11 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 16,
+  },
+  headerEditText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: '600',
   },
   headerIconText: {
     color: '#FFFFFF',

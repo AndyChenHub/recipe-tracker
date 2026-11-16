@@ -12,7 +12,9 @@
       "bundleIdentifier": "com.chena.recipetracker",
       "buildNumber": "1",
       "infoPlist": {
-        "ITSAppUsesNonExemptEncryption": false
+        "ITSAppUsesNonExemptEncryption": false,
+        "NSCameraUsageDescription": "Scan cookbook pages and recipe cards directly into your cookbook.",
+        "NSPhotoLibraryUsageDescription": "Import recipe screenshots and choose cover photos for your recipes."
       }
     },
     "android": {
@@ -41,6 +43,13 @@
           "image": "./assets/images/splash-icon.png",
           "resizeMode": "contain",
           "backgroundColor": "#D94325"
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Import recipe screenshots and choose cover photos for your recipes.",
+          "cameraPermission": "Scan cookbook pages and recipe cards directly into your cookbook."
         }
       ]
     ],

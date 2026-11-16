@@ -1,5 +1,9 @@
 import { autoTokenizeStepTimers } from './scaling';
-import { parseIngredientLine, resolveCanonicalIngredient } from './taxonomy';
+import {
+  CANONICAL_INGREDIENTS,
+  parseIngredientLine,
+  resolveCanonicalIngredient,
+} from './taxonomy';
 import { Recipe, RecipeIngredient, RecipeStep, SourcePlatform } from './types';
 
 /**
@@ -18,6 +22,65 @@ export function detectSourcePlatform(url: string): SourcePlatform {
   if (lower.includes('instagram.com') || lower.includes('instagr.am')) return 'instagram';
   if (lower.includes('youtube.com') || lower.includes('youtu.be')) return 'youtube';
   return 'web';
+}
+
+/**
+ * Cleans WebVTT subtitle files (from TikTok's subtitleInfos / claInfo) into plain spoken text.
+ */
+export function cleanWebVttTranscript(vtt: string): string {
+  const lines = vtt.split(/\r?\n/);
+  const spoken: string[] = [];
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (line === 'WEBVTT' || line.startsWith('NOTE') || line.startsWith('STYLE')) continue;
+    if (/^\d+$/.test(line)) continue;
+    if (/^\d{2}:\d{2}:\d{2}[.,]\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}[.,]\d{3}/.test(line)) continue;
+    if (/^\d{2}:\d{2}[.,]\d{3}\s*-->\s*\d{2}:\d{2}[.,]\d{3}/.test(line)) continue;
+    const stripped = line.replace(/<[^>]+>/g, '').trim();
+    if (stripped && spoken[spoken.length - 1] !== stripped) {
+      spoken.push(stripped);
+    }
+  }
+  return spoken.join(' ').replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Links ingredient mentions inside step prose to {{ing:INDEX}} tokens so
+ * dynamic serving scaling updates quantities inside directions too.
+ */
+export function linkIngredientsInStepText(
+  stepText: string,
+  ingredients: RecipeIngredient[]
+): string {
+  let result = autoTokenizeStepTimers(stepText);
+  if ( result.includes('{{ing:')) {
+    return result;
+  }
+
+  // Match longest ingredient display names first so "chicken breast" matches before "chicken"
+  const indexed = ingredients
+    .map((ing, idx) => ({ ing, idx }))
+    .filter(({ ing }) => ing.displayName.length >= 3 && ing.qtyMin !== null)
+    .sort((a, b) => b.ing.displayName.length - a.ing.displayName.length);
+
+  const usedIndices = new Set<number>();
+
+  for (const { ing, idx } of indexed) {
+    if (usedIndices.has(idx)) continue;
+    const escapedName = ing.displayName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // Match optional quantity + unit + ingredient name, e.g. "2 tbsp butter" or "300 g rigatoni"
+    const qtyUnitNameRegex = new RegExp(
+      `\\b(?:\\d+\\s+\\d+\\/\\d+|\\d+\\/\\d+|\\d+(?:\\.\\d+)?|[⅛¼⅓⅜½⅝⅔¾⅞])\\s*(?:tbsp|tablespoons?|tsp|teaspoons?|cups?|g|grams?|kg|ml|l|oz|ounces?|lbs?|pounds?|cloves?|slices?|cans?)?\\s+(?:of\\s+)?${escapedName}s?\\b`,
+      'i'
+    );
+    if (qtyUnitNameRegex.test(result)) {
+      result = result.replace(qtyUnitNameRegex, `{{ing:${idx}}}`);
+      usedIndices.add(idx);
+    }
+  }
+
+  return result;
 }
 
 function parseIsoDurationToMinutes(iso?: unknown): number | undefined {
@@ -129,7 +192,7 @@ export function parseRecipeFromHtmlJsonLd(html: string, sourceUrl: string): Reci
           id: `step-${idx + 1}-${Date.now().toString(36)}`,
           stepNumber: idx + 1,
           rawText: stepText,
-          tokenizedText: autoTokenizeStepTimers(stepText),
+          tokenizedText: linkIngredientsInStepText(stepText, ingredients),
         }));
 
         const now = new Date().toISOString();
@@ -175,9 +238,113 @@ export function parseRecipeFromHtmlJsonLd(html: string, sourceUrl: string): Reci
   return null;
 }
 
+const IMPERATIVE_STEP_START =
+  /^(?:step\s*\d+|first|second|third|next|then|finally|meanwhile|in a\b|to a\b|heat\b|preheat\b|sear\b|boil\b|cook\b|bake\b|roast\b|fry\b|saute\b|sauté\b|simmer\b|whisk\b|mix\b|stir\b|combine\b|fold\b|add\b|pour\b|transfer\b|remove\b|drain\b|season\b|toss\b|serve\b|garnish\b|let\b|cover\b|place\b|slice\b|cut\b|chop\b)/i;
+
+const SPOKEN_NUMBER_WORDS: Record<string, string> = {
+  one: '1',
+  two: '2',
+  three: '3',
+  four: '4',
+  five: '5',
+  six: '6',
+  seven: '7',
+  eight: '8',
+  nine: '9',
+  ten: '10',
+  twelve: '12',
+  'a half': '1/2',
+  'half a': '1/2',
+  'a quarter': '1/4',
+  'quarter of a': '1/4',
+  'a third': '1/3',
+  'a couple': '2',
+  'a few': '3',
+};
+
+function stripHashtags(str: string): string {
+  return str
+    .replace(/(?:^|\s)#[a-zA-Z0-9_🧭✨🔥🍜🍝🍗🥩🥗🍲]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function normalizeSpokenNumbers(text: string): string {
+  let out = text;
+  for (const [word, digit] of Object.entries(SPOKEN_NUMBER_WORDS)) {
+    const re = new RegExp(`\\b${word}\\b`, 'gi');
+    out = out.replace(re, digit);
+  }
+  return out;
+}
+
 /**
- * Parses unstructured social media caption text or copied notes into a structured Recipe.
- * Handles headings like "Ingredients:" / "Instructions:" / "Method:" or bullet heuristics.
+ * Extracts ingredients and steps from unstructured spoken transcripts or prose paragraphs
+ * when a creator speaks or writes a recipe in paragraph form without bullet lists.
+ */
+function extractFromProseOrTranscript(prose: string): {
+  ingredientLines: string[];
+  stepLines: string[];
+} {
+  const normalized = normalizeSpokenNumbers(prose);
+  const foundIngredients: string[] = [];
+  const seenCanonicalIds = new Set<string>();
+
+  // Sort canonical terms longest-first so "heavy cream" matches before "cream" and "chicken thigh" before "chicken"
+  const candidateTerms: Array<{ term: string; id: string; name: string }> = [];
+  for (const item of CANONICAL_INGREDIENTS) {
+    candidateTerms.push({ term: item.name.toLowerCase(), id: item.id, name: item.name });
+    for (const alias of item.aliases) {
+      if (alias.length >= 3) {
+        candidateTerms.push({ term: alias.toLowerCase(), id: item.id, name: item.name });
+      }
+    }
+  }
+  candidateTerms.sort((a, b) => b.term.length - a.term.length);
+
+  const lowerNorm = normalized.toLowerCase();
+
+  for (const { term, id, name } of candidateTerms) {
+    if (seenCanonicalIds.has(id)) continue;
+    const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(
+      `(?:(\\d+\\s+\\d+\\/\\d+|\\d+\\/\\d+|\\d+(?:\\.\\d+)?|[⅛¼⅓⅜½⅝⅔¾⅞])\\s*(tbsp|tablespoons?|tsp|teaspoons?|cups?|g|grams?|kg|ml|l|oz|ounces?|lbs?|pounds?|cloves?|slices?|cans?|packets?|boxes?|bunches?)?\\s+(?:of\\s+)?(?:fresh\\s+|finely\\s+|minced\\s+|diced\\s+|sliced\\s+|grated\\s+|boneless\\s+|skinless\\s+)*)?\\b${escaped}s?\\b`,
+      'i'
+    );
+    const match = lowerNorm.match(regex);
+    if (match) {
+      seenCanonicalIds.add(id);
+      const qty = match[1]?.trim();
+      const unit = match[2]?.trim();
+      if (qty && unit) {
+        foundIngredients.push(`${qty} ${unit} ${name}`);
+      } else if (qty) {
+        foundIngredients.push(`${qty} ${name}`);
+      } else if (id !== 'water') {
+        foundIngredients.push(name);
+      }
+    }
+  }
+
+  // Split prose into cooking step sentences
+  const rawSentences = normalized
+    .split(/(?<=[.!?])\s+|\r?\n+/)
+    .map((s) => stripHashtags(s).trim())
+    .filter((s) => s.length >= 15);
+
+  const stepLines = rawSentences.filter(
+    (s) =>
+      !/^(?:hey guys|welcome back|follow for more|don't forget to|like and subscribe|link in bio)/i.test(
+        s
+      )
+  );
+
+  return { ingredientLines: foundIngredients, stepLines };
+}
+
+/**
+ * Parses unstructured social media caption text, spoken transcripts, OCR text,
+ * or copied notes into a structured Recipe.
  */
 export function parseRecipeFromCaptionOrText(
   text: string,
@@ -186,59 +353,137 @@ export function parseRecipeFromCaptionOrText(
     sourceUrl?: string;
     sourceAuthor?: string;
     imageUrl?: string;
+    transcript?: string;
   }
 ): Recipe {
-  const lines = text
+  const combinedSource = [text, options?.transcript].filter(Boolean).join('\n\n');
+
+  // Expand inline bullets (•, ·, ▪, ▸) and Unicode line separators (\u2028, \u2029) into distinct lines
+  const normalizedText = combinedSource
+    .replace(/[\u2028\u2029]/g, '\n')
+    .replace(/\s*[•·▪▸➢]\s*/g, '\n• ')
+    .replace(/\b(ingredients|instructions|directions|method|steps)\s*:/gi, '\n$1:\n');
+
+  const rawLines = normalizedText
     .split(/\r?\n/)
-    .map((l) => l.trim())
+    .map((l) => stripHashtags(l).trim())
     .filter(Boolean);
 
-  let inferredTitle = options?.title?.trim() || '';
+  let inferredTitle = stripHashtags(options?.title?.trim() || '');
   const ingredientLines: string[] = [];
   const stepLines: string[] = [];
 
   let section: 'header' | 'ingredients' | 'steps' = 'header';
 
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const cleanHeader = line.toLowerCase().replace(/[:\-—*#]/g, '').trim();
+  for (let i = 0; i < rawLines.length; i++) {
+    const line = rawLines[i];
+    const cleanHeader = line
+      .toLowerCase()
+      .replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '')
+      .trim();
 
-    if (!inferredTitle && i === 0 && line.length < 85 && !/^\d/.test(line)) {
-      inferredTitle = line.replace(/^#+\s*/, '');
-      continue;
-    }
-
-    if (cleanHeader === 'ingredients' || cleanHeader === 'what you need') {
+    if (
+      cleanHeader === 'ingredients' ||
+      cleanHeader === 'ingredient list' ||
+      cleanHeader === 'what you need' ||
+      cleanHeader === 'what youll need' ||
+      cleanHeader.startsWith('for the ')
+    ) {
       section = 'ingredients';
       continue;
     }
+
     if (
       cleanHeader === 'instructions' ||
       cleanHeader === 'directions' ||
       cleanHeader === 'method' ||
       cleanHeader === 'steps' ||
-      cleanHeader === 'preparation'
+      cleanHeader === 'preparation' ||
+      cleanHeader === 'how to make' ||
+      cleanHeader === 'how to make it'
     ) {
       section = 'steps';
       continue;
     }
 
+    // Strip leading bullets/emojis for testing
+    const withoutBullet = line
+      .replace(/^[\s•\-*▪▸➢✅👉🔸🔹🍴🥄🧄🧅🍗🥩🧀🍅🍋]+/, '')
+      .trim();
+    if (!withoutBullet) continue;
+
+    // Infer title from first non-ingredient, non-numbered short line if not provided
+    if (
+      !inferredTitle &&
+      i === 0 &&
+      withoutBullet.length <= 85 &&
+      !/^(?:\d+\/\d+|\d+\s*(?:tbsp|tsp|cup|g|kg|ml|oz|lb|clove))/i.test(withoutBullet)
+    ) {
+      inferredTitle = withoutBullet.replace(/^#+\s*/, '');
+      continue;
+    }
+
+    const isNumberedStep = /^(?:step\s*)?\d+[.):]\s+[A-Za-z]/i.test(withoutBullet);
+    const startsWithQuantity =
+      /^(?:\d+\s+\d+\/\d+|\d+\/\d+|\d+(?:\.\d+)?|[⅛¼⅓⅜½⅝⅔¾⅞])\s*(?:tbsp|tablespoons?|tsp|teaspoons?|cups?|g|grams?|kg|ml|l|oz|ounces?|lbs?|pounds?|cloves?|cans?|slices?|packets?|boxes?|bunches?|pinch|fillets?|breasts?|thighs?|eggs?|onions?|lemons?|limes?|potatoes?|tomatoes?)\b/i.test(
+        withoutBullet
+      );
+
+    // Check if a short line resolves to a known canonical ingredient (e.g. "2 salmon fillets" or "Salt and pepper to taste")
+    const parsedCandidate = parseIngredientLine(withoutBullet, 0);
+    const isKnownCanonicalIngredient =
+      !parsedCandidate.canonicalIngredientId.startsWith('custom-') &&
+      withoutBullet.length < 75 &&
+      !IMPERATIVE_STEP_START.test(withoutBullet);
+
     if (section === 'ingredients') {
-      ingredientLines.push(line);
+      // Transition automatically to steps if the creator starts listing numbered steps or long cooking sentences
+      if (
+        isNumberedStep ||
+        (withoutBullet.length > 75 && IMPERATIVE_STEP_START.test(withoutBullet))
+      ) {
+        section = 'steps';
+        stepLines.push(withoutBullet.replace(/^(?:step\s*)?\d+[.):]\s*/i, ''));
+      } else {
+        ingredientLines.push(withoutBullet);
+      }
     } else if (section === 'steps') {
-      stepLines.push(line.replace(/^(?:step\s*)?\d+[.)]\s*/i, ''));
+      stepLines.push(withoutBullet.replace(/^(?:step\s*)?\d+[.):]\s*/i, ''));
     } else {
-      // Heuristic classification when a TikTok/IG caption has no explicit headers
-      const looksLikeIngredient =
-        /^(?:[-•*]|\d+\/\d+|\d+(?:\.\d+)?\s*(?:tbsp|tsp|cup|cups|g|kg|ml|oz|lb|lbs|cloves?|cans?|slices?)\b|[⅛¼⅓½⅔¾])/i.test(
-          line
-        ) && line.length < 95;
-      if (looksLikeIngredient) {
-        ingredientLines.push(line);
-      } else if (line.length > 25 && !line.startsWith('#')) {
-        stepLines.push(line.replace(/^(?:step\s*)?\d+[.)]\s*/i, ''));
+      // Header/unsectioned mode (common in TikTok captions without "Ingredients:" headings)
+      if (startsWithQuantity || (isKnownCanonicalIngredient && (line.startsWith('•') || line.startsWith('-') || line.startsWith('*') || parsedCandidate.qtyMin !== null))) {
+        ingredientLines.push(withoutBullet);
+      } else if (
+        isNumberedStep ||
+        IMPERATIVE_STEP_START.test(withoutBullet) ||
+        withoutBullet.length > 35
+      ) {
+        stepLines.push(withoutBullet.replace(/^(?:step\s*)?\d+[.):]\s*/i, ''));
+      } else if (isKnownCanonicalIngredient) {
+        ingredientLines.push(withoutBullet);
       }
     }
+  }
+
+  // Fallback: if caption was prose or a spoken transcript with 0 structured ingredient lines,
+  // run prose/transcript ingredient & sentence extraction!
+  if (ingredientLines.length === 0 && combinedSource.trim().length > 0) {
+    const bodyWithoutTitle = rawLines
+      .filter((l) => l.replace(/^#+\s*/, '').trim() !== inferredTitle)
+      .join('\n');
+    const proseExtracted = extractFromProseOrTranscript(bodyWithoutTitle || combinedSource);
+    if (proseExtracted.ingredientLines.length > 0) {
+      ingredientLines.push(...proseExtracted.ingredientLines);
+    }
+    if (proseExtracted.stepLines.length > 0) {
+      stepLines.length = 0;
+      stepLines.push(...proseExtracted.stepLines);
+    }
+  }
+
+  // If title is still overly long (e.g. entire TikTok caption passed as title), trim to first sentence/clause
+  if (inferredTitle.length > 80) {
+    inferredTitle = inferredTitle.split(/[.\n!|•]/)[0].trim().slice(0, 75);
   }
 
   const ingredients: RecipeIngredient[] = ingredientLines.map((line, idx) =>
@@ -248,7 +493,7 @@ export function parseRecipeFromCaptionOrText(
     id: `step-${idx + 1}-${Date.now().toString(36)}`,
     stepNumber: idx + 1,
     rawText: s,
-    tokenizedText: autoTokenizeStepTimers(s),
+    tokenizedText: linkIngredientsInStepText(s, ingredients),
   }));
 
   const now = new Date().toISOString();
@@ -262,7 +507,10 @@ export function parseRecipeFromCaptionOrText(
     sourceUrl: options?.sourceUrl,
     sourcePlatform: platform,
     sourceAuthor: options?.sourceAuthor,
-    categories: platform === 'tiktok' || platform === 'instagram' ? ['Social Saves'] : ['Imported'],
+    categories:
+      platform === 'tiktok' || platform === 'instagram' || platform === 'youtube'
+        ? ['Social Saves']
+        : ['Imported'],
     isFavorite: false,
     ingredients,
     steps,
@@ -327,7 +575,9 @@ export function hydrateStructuredImportPayload(payload: {
     id: `step-${idx + 1}-${Date.now().toString(36)}`,
     stepNumber: idx + 1,
     rawText: s.rawText,
-    tokenizedText: s.tokenizedText ? autoTokenizeStepTimers(s.tokenizedText) : autoTokenizeStepTimers(s.rawText),
+    tokenizedText: s.tokenizedText
+      ? autoTokenizeStepTimers(s.tokenizedText)
+      : linkIngredientsInStepText(s.rawText, ingredients),
     groupName: s.groupName,
   }));
 

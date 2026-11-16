@@ -21,7 +21,8 @@ SplashScreen.preventAutoHideAsync();
 function extractSharedTargetFromDeepLink(rawUrl: string): string | null {
   try {
     const parsed = Linking.parse(rawUrl);
-    const paramUrl = parsed.queryParams?.url ?? parsed.queryParams?.shared ?? parsed.queryParams?.text;
+    const paramUrl =
+      parsed.queryParams?.url ?? parsed.queryParams?.shared ?? parsed.queryParams?.text;
     if (typeof paramUrl === 'string' && paramUrl.trim().length > 0) {
       return paramUrl.trim();
     }
@@ -31,10 +32,6 @@ function extractSharedTargetFromDeepLink(rawUrl: string): string | null {
   return null;
 }
 
-/**
- * Handles both cold-start and warm-resume deep links from the iOS Share Sheet Shortcut:
- * e.g. recipetracker://import?url=https://www.tiktok.com/...
- */
 function DeepLinkShareBridge() {
   const router = useRouter();
   const lastHandledRef = useRef<string | null>(null);
@@ -107,6 +104,13 @@ function RootLayoutNav() {
           options={{
             title: '',
             headerBackTitle: 'Recipes',
+          }}
+        />
+        <Stack.Screen
+          name="editor"
+          options={{
+            presentation: 'modal',
+            title: 'New Recipe',
           }}
         />
       </Stack>

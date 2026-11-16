@@ -1,12 +1,12 @@
-import 'react-native-url-polyfill/auto';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import {
+  cleanWebVttTranscript,
   extractUrlFromSharedText,
   hydrateStructuredImportPayload,
   parseRecipeFromCaptionOrText,
   parseRecipeFromHtmlJsonLd,
-} from '@/src/domain/importer';
-import { GroceryItem, Recipe } from '@/src/domain/types';
+} from '../domain/importer';
+import { GroceryItem, Recipe } from '../domain/types';
 
 export interface CloudSettings {
   supabaseUrl: string;
@@ -33,6 +33,33 @@ function makeSupabase(settings: CloudSettings): SupabaseClient | null {
   return createClient(settings.supabaseUrl.trim(), settings.supabaseAnonKey.trim(), {
     auth: { persistSession: false },
   });
+}
+
+async function fetchWithTimeout(
+  url: string,
+  options?: RequestInit,
+  timeoutMs = 8500
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: options?.signal ?? controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function decodeHtmlEntities(str: string): string {
+  return str
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#x27;|&#39;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&#(\d+);/g, (_m, code) => String.fromCharCode(Number(code)));
 }
 
 function mapDbRowToRecipe(row: Record<string, unknown>): Recipe {
@@ -164,11 +191,15 @@ export async function syncCloudGroceryItems(
 async function extractWithDirectGemini(
   geminiKey: string,
   contextText: string,
-  sourceUrl?: string,
-  imageUrl?: string,
-  author?: string
+  options?: {
+    sourceUrl?: string;
+    imageUrl?: string;
+    author?: string;
+    inlineImageBase64?: string;
+    inlineImageMimeType?: string;
+  }
 ): Promise<Recipe> {
-  const prompt = `Extract a clean, structured cooking recipe JSON from the content below.
+  const prompt = `Extract a clean, structured cooking recipe JSON from the provided content or image.
 Schema keys required:
 - title (string)
 - description (string)
@@ -183,16 +214,27 @@ In tokenizedText, replace direct ingredient mentions with {{ing:INDEX}} (0-based
 Content:
 ${contextText}`;
 
-  const resp = await fetch(
+  const parts: Array<Record<string, unknown>> = [{ text: prompt }];
+  if (options?.inlineImageBase64) {
+    parts.push({
+      inlineData: {
+        mimeType: options.inlineImageMimeType || 'image/jpeg',
+        data: options.inlineImageBase64,
+      },
+    });
+  }
+
+  const resp = await fetchWithTimeout(
     `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiKey.trim()}`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
+        contents: [{ parts }],
         generationConfig: { responseMimeType: 'application/json' },
       }),
-    }
+    },
+    18000
   );
   if (!resp.ok) {
     throw new Error(`Gemini API returned ${resp.status}`);
@@ -202,30 +244,290 @@ ${contextText}`;
   const parsed = JSON.parse(rawJson);
   return hydrateStructuredImportPayload({
     ...parsed,
-    sourceUrl,
-    imageUrl: imageUrl || parsed.imageUrl,
-    sourceAuthor: author || parsed.sourceAuthor,
+    sourceUrl: options?.sourceUrl,
+    imageUrl: options?.imageUrl || parsed.imageUrl,
+    sourceAuthor: options?.author || parsed.sourceAuthor,
   });
 }
 
+export interface TikTokExtractedContext {
+  title?: string;
+  caption: string;
+  transcript: string;
+  author?: string;
+  thumbnailUrl?: string;
+  resolvedUrl: string;
+}
+
 /**
- * Multi-tier Recipe Importer:
+ * Multi-source TikTok Extractor:
+ * 1. Handles TikTok Notes / Lemon8 (`notes.tiktok.com`) article pages
+ * 2. Queries `tikwm.com/api` (resolves `vt.tiktok.com` / `vm.tiktok.com` shortlinks + returns full caption, cover, author)
+ * 3. Fetches TikTok HTML with `User-Agent: curl/8.4.0` to extract `__UNIVERSAL_DATA_FOR_REHYDRATION__`
+ *    AND downloads the video's spoken `WEBVTT` voiceover subtitles (`subtitleInfos` / `claInfo`)!
+ */
+export async function fetchTikTokContext(url: string): Promise<TikTokExtractedContext> {
+  let caption = '';
+  let transcript = '';
+  let author: string | undefined;
+  let thumbnailUrl: string | undefined;
+  let title: string | undefined;
+  let resolvedUrl = url;
+
+  // Path 1: TikTok Notes / Lemon8 (`notes.tiktok.com`)
+  if (url.toLowerCase().includes('notes.tiktok.com')) {
+    try {
+      const resp = await fetchWithTimeout(url, undefined, 8000);
+      const html = await resp.text();
+      const ogTitle = html.match(/<meta[^>]*property=["']og:title["'][^>]*content=["']([^"']+)["']/i)?.[1];
+      const ogImage = html.match(/<meta[^>]*property=["']og:image["'][^>]*content=["']([^"']+)["']/i)?.[1];
+      if (ogTitle) title = decodeHtmlEntities(ogTitle);
+      if (ogImage) thumbnailUrl = decodeHtmlEntities(ogImage);
+
+      const plain = decodeHtmlEntities(
+        html
+          .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+          .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+          .replace(/<[^>]+>/g, '\n')
+      )
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter(Boolean)
+        .join('\n');
+
+      caption = plain.slice(0, 6000);
+      return { title, caption, transcript, author, thumbnailUrl, resolvedUrl };
+    } catch {
+      // Continue to other extractors
+    }
+  }
+
+  // Path 2 & 3 in parallel: tikwm API + direct rehydration HTML with WebVTT subtitle extraction
+  const tikwmPromise = (async () => {
+    try {
+      const resp = await fetchWithTimeout(
+        `https://www.tikwm.com/api/?url=${encodeURIComponent(url)}`,
+        undefined,
+        7500
+      );
+      if (!resp.ok) return null;
+      const json = await resp.json();
+      if (json?.code === 0 && json?.data) {
+        return json.data as Record<string, unknown>;
+      }
+    } catch {
+      // Ignore tikwm failure
+    }
+    return null;
+  })();
+
+  const rehydrationPromise = (async () => {
+    try {
+      const resp = await fetchWithTimeout(
+        url,
+        {
+          headers: {
+            'User-Agent': 'curl/8.4.0',
+            Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          },
+        },
+        7500
+      );
+      if (resp.url) resolvedUrl = resp.url;
+      const html = await resp.text();
+      const match = html.match(
+        /<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([\s\S]*?)<\/script>/i
+      );
+      if (!match) return null;
+      const parsed = JSON.parse(match[1]);
+      const scope = parsed?.__DEFAULT_SCOPE__;
+      const item =
+        scope?.['webapp.video-detail']?.itemInfo?.itemStruct ??
+        scope?.['webapp.reflow.video.detail']?.itemInfo?.itemStruct;
+      if (!item) return null;
+
+      // Check for spoken WebVTT subtitles in subtitleInfos or claInfo
+      const subs: Array<Record<string, unknown>> = Array.isArray(item.video?.subtitleInfos)
+        ? item.video.subtitleInfos
+        : [];
+      const claSubs: Array<Record<string, unknown>> = Array.isArray(
+        item.video?.claInfo?.captionInfos
+      )
+        ? item.video.claInfo.captionInfos
+        : [];
+
+      const subUrl = String(subs[0]?.Url ?? subs[0]?.url ?? claSubs[0]?.url ?? claSubs[0]?.Url ?? '');
+      let vttTranscript = '';
+      if (subUrl.startsWith('http')) {
+        try {
+          const vttResp = await fetchWithTimeout(subUrl, undefined, 5000);
+          if (vttResp.ok) {
+            const rawVtt = await vttResp.text();
+            vttTranscript = cleanWebVttTranscript(rawVtt);
+          }
+        } catch {
+          // Ignore subtitle fetch error
+        }
+      }
+
+      return { item, vttTranscript };
+    } catch {
+      return null;
+    }
+  })();
+
+  const [tikwmData, rehydData] = await Promise.all([tikwmPromise, rehydrationPromise]);
+
+  if (rehydData?.item) {
+    const item = rehydData.item;
+    caption = String(item.desc ?? item.imagePost?.title ?? '').trim();
+    if (item.imagePost?.title) {
+      title = String(item.imagePost.title).trim();
+    }
+    const authObj = item.author as Record<string, unknown> | undefined;
+    if (authObj?.uniqueId) {
+      author = `@${authObj.uniqueId}`;
+    } else if (authObj?.nickname) {
+      author = String(authObj.nickname);
+    }
+    if (item.video?.cover || item.video?.originCover) {
+      thumbnailUrl = String(item.video.cover || item.video.originCover);
+    }
+    if (rehydData.vttTranscript) {
+      transcript = rehydData.vttTranscript;
+    }
+  }
+
+  if (tikwmData) {
+    const twTitle = String(tikwmData.title ?? '').trim();
+    const twContentDesc = Array.isArray(tikwmData.content_desc)
+      ? tikwmData.content_desc.join('\n').trim()
+      : '';
+    const bestTwCaption = twContentDesc.length > twTitle.length ? twContentDesc : twTitle;
+    if (bestTwCaption.length > caption.length) {
+      caption = bestTwCaption;
+    }
+    if (!thumbnailUrl && (tikwmData.origin_cover || tikwmData.cover)) {
+      thumbnailUrl = String(tikwmData.origin_cover || tikwmData.cover);
+    }
+    const twAuthor = tikwmData.author as Record<string, unknown> | undefined;
+    if (!author && twAuthor) {
+      author = twAuthor.unique_id
+        ? `@${twAuthor.unique_id}`
+        : twAuthor.nickname
+          ? String(twAuthor.nickname)
+          : undefined;
+    }
+  }
+
+  return { title, caption, transcript, author, thumbnailUrl, resolvedUrl };
+}
+
+/**
+ * Scans a cookbook page photo or recipe screenshot (base64 JPEG/PNG)
+ * using Gemini 2.5 Flash Vision (if key configured) or OCR.space Engine 2 (free, zero-config).
+ */
+export async function scanRecipeFromImageBase64(
+  base64Data: string,
+  mimeType = 'image/jpeg',
+  settings: CloudSettings,
+  localImageUri?: string
+): Promise<{ recipe: Recipe; rawText: string; methodUsed: string }> {
+  const cleanB64 = base64Data.replace(/^data:image\/[a-zA-Z+]+;base64,/, '');
+
+  // Tier 1: Gemini 2.5 Flash Multimodal Vision
+  if (settings.geminiApiKey.trim()) {
+    try {
+      const recipe = await extractWithDirectGemini(
+        settings.geminiApiKey,
+        'Extract the full recipe (title, servings, ingredients with quantities, and step-by-step instructions) from this scanned cookbook page or recipe screenshot.',
+        {
+          imageUrl: localImageUri,
+          inlineImageBase64: cleanB64,
+          inlineImageMimeType: mimeType,
+        }
+      );
+      recipe.categories = ['Scanned'];
+      return {
+        recipe,
+        rawText: recipe.ingredients.map((i) => i.rawText).join('\n'),
+        methodUsed: 'Gemini Vision Page Scanner',
+      };
+    } catch {
+      // Fall back to OCR.space below
+    }
+  }
+
+  // Tier 2: Built-in Zero-Config Cloud OCR (OCR.space Engine 2)
+  const form = new URLSearchParams();
+  form.append('apikey', 'helloworld');
+  form.append('base64Image', `data:${mimeType};base64,${cleanB64}`);
+  form.append('language', 'eng');
+  form.append('OCREngine', '2');
+  form.append('scale', 'true');
+
+  const resp = await fetchWithTimeout(
+    'https://api.ocr.space/parse/image',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: form.toString(),
+    },
+    15000
+  );
+
+  if (!resp.ok) {
+    throw new Error(`Page OCR service returned HTTP ${resp.status}.`);
+  }
+
+  const ocrJson = await resp.json();
+  const parsedText = String(ocrJson?.ParsedResults?.[0]?.ParsedText ?? '').trim();
+
+  if (!parsedText) {
+    throw new Error(
+      'Could not read text from this image. Try a clearer photo or add your Gemini API Key in Cloud Sync for AI Vision scanning.'
+    );
+  }
+
+  const recipe = parseRecipeFromCaptionOrText(parsedText, {
+    imageUrl: localImageUri,
+  });
+  recipe.categories = ['Scanned'];
+
+  return {
+    recipe,
+    rawText: parsedText,
+    methodUsed: 'Cookbook Page OCR Scanner',
+  };
+}
+
+export interface UniversalImportResult {
+  recipe: Recipe;
+  methodUsed: string;
+  needsManualCompletion?: boolean;
+}
+
+/**
+ * Multi-tier Universal Recipe Importer:
  * 1. Tries Supabase Edge Function (/functions/v1/import-recipe) if cloud is configured
- * 2. Falls back to direct fetch + schema.org JSON-LD / TikTok oEmbed + optional Gemini Flash
- * 3. Parses raw pasted social media captions or cookbook text offline
+ * 2. Dedicated TikTok extractor (tikwm + __UNIVERSAL_DATA_FOR_REHYDRATION__ + WebVTT spoken subtitles + Notes)
+ * 3. Web schema.org/Recipe JSON-LD + OpenGraph + optional Gemini Flash
+ * 4. Raw pasted social media captions or cookbook text offline
  */
 export async function importRecipeUniversal(
   rawInput: string,
   settings: CloudSettings
-): Promise<{ recipe: Recipe; methodUsed: string }> {
+): Promise<UniversalImportResult> {
   const trimmed = rawInput.trim();
   if (!trimmed) {
     throw new Error('Please paste a recipe URL or caption text first.');
   }
 
   const cleanUrl = extractUrlFromSharedText(trimmed);
+  // Check if user pasted BOTH a URL and extra caption lines
+  const textAlongsideUrl = cleanUrl ? trimmed.replace(cleanUrl, '').trim() : '';
 
-  // Tier A: Cloud Edge Function (handles TikTok/IG transcripts, Gemini extraction, and thumbnail storage)
+  // Tier A: Cloud Edge Function (if configured)
   const client = makeSupabase(settings);
   if (client && cleanUrl) {
     try {
@@ -233,70 +535,114 @@ export async function importRecipeUniversal(
         body: { url: cleanUrl, ownerKey: settings.ownerKey || 'personal', saveToDb: false },
       });
       if (!error && data?.ok && data?.recipe) {
-        return {
-          recipe: hydrateStructuredImportPayload(data.recipe),
-          methodUsed: 'Supabase Cloud Importer',
-        };
+        const hydrated = hydrateStructuredImportPayload(data.recipe);
+        if (hydrated.ingredients.length > 0 || hydrated.steps.length > 0) {
+          return {
+            recipe: hydrated,
+            methodUsed: 'Supabase Cloud Importer',
+          };
+        }
       }
     } catch {
       // Fall through to client extraction tiers
     }
   }
 
-  // Tier B: Direct URL Inspection (TikTok oEmbed / Web JSON-LD / OpenGraph)
-  if (cleanUrl) {
-    if (cleanUrl.includes('tiktok.com')) {
+  // Tier B: Dedicated TikTok Video / Shortlink / Photo / Notes Extractor
+  if (cleanUrl && cleanUrl.toLowerCase().includes('tiktok.com')) {
+    const tt = await fetchTikTokContext(cleanUrl);
+    const fullCaption = [textAlongsideUrl, tt.caption].filter(Boolean).join('\n');
+    const combinedContext = [
+      tt.title ? `Title: ${tt.title}` : '',
+      fullCaption ? `Caption:\n${fullCaption}` : '',
+      tt.transcript ? `Spoken Video Transcript:\n${tt.transcript}` : '',
+    ]
+      .filter(Boolean)
+      .join('\n\n');
+
+    if (settings.geminiApiKey.trim() && combinedContext.length > 10) {
       try {
-        const oembedResp = await fetch(
-          `https://www.tiktok.com/oembed?url=${encodeURIComponent(cleanUrl)}`
-        );
-        if (oembedResp.ok) {
-          const meta = await oembedResp.json();
-          const captionText = String(meta.title ?? '');
-          if (settings.geminiApiKey.trim()) {
-            const aiRecipe = await extractWithDirectGemini(
-              settings.geminiApiKey,
-              `TikTok by ${meta.author_name ?? ''}:\n${captionText}`,
-              cleanUrl,
-              meta.thumbnail_url,
-              meta.author_name
-            );
-            return { recipe: aiRecipe, methodUsed: 'TikTok oEmbed + Gemini AI' };
-          }
-          return {
-            recipe: parseRecipeFromCaptionOrText(captionText, {
-              sourceUrl: cleanUrl,
-              sourceAuthor: meta.author_name,
-              imageUrl: meta.thumbnail_url,
-            }),
-            methodUsed: 'TikTok Caption Parser',
-          };
+        const aiRecipe = await extractWithDirectGemini(settings.geminiApiKey, combinedContext, {
+          sourceUrl: tt.resolvedUrl || cleanUrl,
+          imageUrl: tt.thumbnailUrl,
+          author: tt.author,
+        });
+        if (aiRecipe.ingredients.length > 0 || aiRecipe.steps.length > 0) {
+          return { recipe: aiRecipe, methodUsed: 'TikTok + Gemini AI' };
         }
       } catch {
-        // Continue to generic fetch
+        // Fall through to local caption + transcript parser
       }
     }
 
+    if (fullCaption || tt.transcript) {
+      const parsed = parseRecipeFromCaptionOrText(fullCaption, {
+        title: tt.title,
+        sourceUrl: tt.resolvedUrl || cleanUrl,
+        sourceAuthor: tt.author,
+        imageUrl: tt.thumbnailUrl,
+        transcript: tt.transcript,
+      });
+
+      const hasContent = parsed.ingredients.length > 0 || parsed.steps.length > 0;
+      return {
+        recipe: parsed,
+        methodUsed: tt.transcript
+          ? 'TikTok Caption + Voiceover Transcript Parser'
+          : 'TikTok Recipe Parser',
+        needsManualCompletion: !hasContent,
+      };
+    }
+
+    // Even if the TikTok video had zero caption and zero subtitles (e.g. music-only clip),
+    // return metadata so the user can complete it in the Recipe Editor instead of hitting a dead end
+    const shell = parseRecipeFromCaptionOrText(textAlongsideUrl || tt.title || 'TikTok Recipe', {
+      title: tt.title || (tt.author ? `TikTok Recipe by ${tt.author}` : 'TikTok Recipe'),
+      sourceUrl: tt.resolvedUrl || cleanUrl,
+      sourceAuthor: tt.author,
+      imageUrl: tt.thumbnailUrl,
+    });
+    return {
+      recipe: shell,
+      methodUsed: 'TikTok Metadata Extractor',
+      needsManualCompletion: shell.ingredients.length === 0 && shell.steps.length === 0,
+    };
+  }
+
+  // Tier C: Direct Web / Instagram / YouTube URL Inspection (schema.org JSON-LD + OpenGraph)
+  if (cleanUrl) {
     try {
-      const pageResp = await fetch(cleanUrl);
+      const pageResp = await fetchWithTimeout(
+        cleanUrl,
+        {
+          headers: {
+            'User-Agent':
+              'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+          },
+        },
+        8500
+      );
       const html = await pageResp.text();
 
-      // Deterministic schema.org/Recipe JSON-LD (instant & free for 90% of recipe websites)
+      // Deterministic schema.org/Recipe JSON-LD (instant & free for >90% of recipe websites)
       const jsonLdRecipe = parseRecipeFromHtmlJsonLd(html, cleanUrl);
-      if (jsonLdRecipe && jsonLdRecipe.ingredients.length > 0) {
+      if (jsonLdRecipe && (jsonLdRecipe.ingredients.length > 0 || jsonLdRecipe.steps.length > 0)) {
         return { recipe: jsonLdRecipe, methodUsed: 'Web schema.org/Recipe Parser' };
       }
 
-      const ogTitle =
-        html.match(/<meta[^>]*property=["']og:title["'][^>]*content=["']([^"']+)["']/i)?.[1] ?? '';
-      const ogDesc =
+      const ogTitle = decodeHtmlEntities(
+        html.match(/<meta[^>]*property=["']og:title["'][^>]*content=["']([^"']+)["']/i)?.[1] ?? ''
+      );
+      const ogDesc = decodeHtmlEntities(
         html.match(/<meta[^>]*property=["']og:description["'][^>]*content=["']([^"']+)["']/i)?.[1] ??
-        '';
+          html.match(/<meta[^>]*name=["']description["'][^>]*content=["']([^"']+)["']/i)?.[1] ??
+          ''
+      );
       const ogImage = html.match(
         /<meta[^>]*property=["']og:image["'][^>]*content=["']([^"']+)["']/i
       )?.[1];
 
-      const combinedMeta = `${ogTitle}\n${ogDesc}`.trim();
+      const combinedMeta = [textAlongsideUrl, ogTitle, ogDesc].filter(Boolean).join('\n');
       if (settings.geminiApiKey.trim()) {
         const bodySnippet = html
           .replace(/<script[\s\S]*?<\/script>/gi, ' ')
@@ -307,38 +653,55 @@ export async function importRecipeUniversal(
         const aiRecipe = await extractWithDirectGemini(
           settings.geminiApiKey,
           `${combinedMeta}\n\n${bodySnippet}`,
-          cleanUrl,
-          ogImage
+          {
+            sourceUrl: cleanUrl,
+            imageUrl: ogImage,
+          }
         );
         return { recipe: aiRecipe, methodUsed: 'Gemini AI Extractor' };
       }
 
-      if (combinedMeta.length > 20) {
+      if (combinedMeta.length > 10) {
+        const parsed = parseRecipeFromCaptionOrText(combinedMeta, {
+          title: ogTitle,
+          sourceUrl: cleanUrl,
+          imageUrl: ogImage,
+        });
         return {
-          recipe: parseRecipeFromCaptionOrText(combinedMeta, {
-            title: ogTitle,
-            sourceUrl: cleanUrl,
-            imageUrl: ogImage,
-          }),
-          methodUsed: 'Social OpenGraph Caption Parser',
+          recipe: parsed,
+          methodUsed: 'Social OpenGraph Parser',
+          needsManualCompletion: parsed.ingredients.length === 0 && parsed.steps.length === 0,
         };
       }
     } catch {
-      // If mobile network / CORS blocks direct page scrape without Edge Function, guide user cleanly
+      if (textAlongsideUrl.length > 15) {
+        const parsed = parseRecipeFromCaptionOrText(textAlongsideUrl, { sourceUrl: cleanUrl });
+        return {
+          recipe: parsed,
+          methodUsed: 'Caption Fallback Parser',
+          needsManualCompletion: parsed.ingredients.length === 0 && parsed.steps.length === 0,
+        };
+      }
       throw new Error(
-        'Direct scraping was blocked by this platform. Connect your Supabase Edge Function (or paste the post caption below) to import from locked social reels.'
+        'Could not reach this URL directly. You can paste the recipe caption text, scan a screenshot, or tap "+ Manual Recipe".'
       );
     }
   }
 
-  // Tier C: Raw Caption / Pasted Text (with Gemini if configured, or deterministic local parser)
+  // Tier D: Raw Pasted Caption or Cookbook Text
   if (settings.geminiApiKey.trim()) {
-    const aiRecipe = await extractWithDirectGemini(settings.geminiApiKey, trimmed);
-    return { recipe: aiRecipe, methodUsed: 'Gemini AI Text Parser' };
+    try {
+      const aiRecipe = await extractWithDirectGemini(settings.geminiApiKey, trimmed);
+      return { recipe: aiRecipe, methodUsed: 'Gemini AI Text Parser' };
+    } catch {
+      // Fall back to deterministic parser below
+    }
   }
 
+  const parsed = parseRecipeFromCaptionOrText(trimmed);
   return {
-    recipe: parseRecipeFromCaptionOrText(trimmed),
-    methodUsed: 'Local Smart Recipe Parser',
+    recipe: parsed,
+    methodUsed: 'Smart Recipe Parser',
+    needsManualCompletion: parsed.ingredients.length === 0 && parsed.steps.length === 0,
   };
 }

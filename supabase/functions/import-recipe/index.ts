@@ -47,6 +47,23 @@ function isSocialUrl(url: string): boolean {
   return /tiktok\.com|instagram\.com|instagr\.am|youtube\.com\/shorts|youtu\.be/i.test(url);
 }
 
+function cleanWebVtt(vtt: string): string {
+  return vtt
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(
+      (l) =>
+        l &&
+        l !== 'WEBVTT' &&
+        !l.startsWith('NOTE') &&
+        !/^\d+$/.test(l) &&
+        !l.includes('-->')
+    )
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 async function fetchSocialContext(url: string): Promise<{
   caption: string;
   transcript: string;
@@ -70,21 +87,67 @@ async function fetchSocialContext(url: string): Promise<{
         };
       }
     } catch {
-      // Fallback to oEmbed / OpenGraph below
+      // Fallback below
     }
   }
 
-  // Fallback: TikTok / YouTube oEmbed or page OpenGraph meta tags
   if (url.includes('tiktok.com')) {
-    const oembed = await fetch(`https://www.tiktok.com/oembed?url=${encodeURIComponent(url)}`);
-    if (oembed.ok) {
-      const data = await oembed.json();
-      return {
-        caption: data.title || '',
-        transcript: '',
-        thumbnailUrl: data.thumbnail_url,
-        author: data.author_name,
-      };
+    let caption = '';
+    let transcript = '';
+    let thumbnailUrl: string | undefined;
+    let author: string | undefined;
+
+    try {
+      const tw = await fetch(`https://www.tikwm.com/api/?url=${encodeURIComponent(url)}`);
+      if (tw.ok) {
+        const twJson = await tw.json();
+        if (twJson?.code === 0 && twJson?.data) {
+          caption = String(twJson.data.title || '');
+          thumbnailUrl = twJson.data.origin_cover || twJson.data.cover;
+          author = twJson.data.author?.unique_id
+            ? `@${twJson.data.author.unique_id}`
+            : twJson.data.author?.nickname;
+        }
+      }
+    } catch {
+      // Continue to direct rehydration
+    }
+
+    try {
+      const pageResp = await fetch(url, {
+        headers: { 'User-Agent': 'curl/8.4.0' },
+        redirect: 'follow',
+      });
+      const html = await pageResp.text();
+      const match = html.match(
+        /<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([\s\S]*?)<\/script>/i
+      );
+      if (match) {
+        const parsed = JSON.parse(match[1]);
+        const item =
+          parsed?.__DEFAULT_SCOPE__?.['webapp.video-detail']?.itemInfo?.itemStruct;
+        if (item) {
+          if (item.desc && item.desc.length > caption.length) caption = item.desc;
+          if (!thumbnailUrl && item.video?.cover) thumbnailUrl = item.video.cover;
+          if (!author && item.author?.uniqueId) author = `@${item.author.uniqueId}`;
+
+          const subUrl =
+            item.video?.subtitleInfos?.[0]?.Url ||
+            item.video?.claInfo?.captionInfos?.[0]?.url;
+          if (subUrl) {
+            const vttResp = await fetch(subUrl);
+            if (vttResp.ok) {
+              transcript = cleanWebVtt(await vttResp.text());
+            }
+          }
+        }
+      }
+    } catch {
+      // Ignore rehydration error
+    }
+
+    if (caption || transcript) {
+      return { caption, transcript, thumbnailUrl, author };
     }
   }
 
@@ -219,7 +282,6 @@ Deno.serve(async (req) => {
         });
         const html = await webResp.text();
         detectedThumb = html.match(/<meta[^>]*property=["']og:image["'][^>]*content=["']([^"']+)["']/i)?.[1];
-        // Strip script/style bloat except JSON-LD
         const jsonLdBlocks = Array.from(
           html.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)
         )
