@@ -2,6 +2,10 @@
 
 All notable changes to Recipe Tracker iOS are documented in this file.
 
+## [v0.1.1] - 2026-11-16
+
+- feat: fix TikTok video/subtitle extraction, add manual recipe editor, page OCR scanner & Clipper navigation (430be17)
+
 ## [v0.1.0] - 2026-11-16
 
 - Initial iOS Expo + Supabase cloud release
