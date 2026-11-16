@@ -51,13 +51,11 @@ jobs:
           npm run typecheck
           npm test
 
-      - name: Auto-Version & Tag Release
+      - name: Compute Target Release Version
         id: version
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
           BUILD_NUMBER="${GITHUB_RUN_NUMBER}"
+          NEEDS_MAIN_COMMIT="false"
 
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             TAG_NAME="${GITHUB_REF_NAME}"
@@ -67,34 +65,25 @@ jobs:
             node scripts/bump-version.mjs "${{ inputs.bump }}"
             APP_VERSION=$(node -p "require('./package.json').version")
             TAG_NAME="v${APP_VERSION}"
-            git add package.json app.json CHANGELOG.md
-            git commit -m "chore(release): ${TAG_NAME} [skip ci]"
-            git tag -f "${TAG_NAME}"
-            git push origin HEAD:main
-            git push -f origin "${TAG_NAME}"
+            NEEDS_MAIN_COMMIT="true"
           else
             CURRENT_VER=$(node -p "require('./package.json').version")
             if git ls-remote --tags origin "refs/tags/v${CURRENT_VER}" | grep -q .; then
               node scripts/bump-version.mjs patch
               APP_VERSION=$(node -p "require('./package.json').version")
               TAG_NAME="v${APP_VERSION}"
-              git add package.json app.json CHANGELOG.md
-              git commit -m "chore(release): ${TAG_NAME} [skip ci]"
-              git tag -f "${TAG_NAME}"
-              git push origin HEAD:main
-              git push -f origin "${TAG_NAME}"
+              NEEDS_MAIN_COMMIT="true"
             else
               APP_VERSION="${CURRENT_VER}"
               TAG_NAME="v${APP_VERSION}"
-              git tag -f "${TAG_NAME}"
-              git push -f origin "${TAG_NAME}"
             fi
           fi
 
           echo "app_version=${APP_VERSION}" >> "$GITHUB_OUTPUT"
           echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
           echo "build_number=${BUILD_NUMBER}" >> "$GITHUB_OUTPUT"
-          echo "Resolved Release: ${TAG_NAME} (Build ${BUILD_NUMBER})"
+          echo "needs_main_commit=${NEEDS_MAIN_COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "Target Release: ${TAG_NAME} (Build ${BUILD_NUMBER})"
 
       - name: Select Latest Xcode Toolchain
         run: |
@@ -119,17 +108,22 @@ jobs:
           HAS_P12_CERT: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 != '' }}
         run: |
           npx expo prebuild --platform ios --clean --no-install
-
-          # Ensure Xcode's JS bundle phase resolves Node 24 cleanly
           echo "export NODE_BINARY=$(command -v node)" > ios/.xcode.env.local
 
-          # Relax pod resource bundle signing when compiling without a .p12 certificate in CI
           if [ "$HAS_P12_CERT" != "true" ]; then
             node -e '
               const fs = require("fs");
               const p = "ios/Podfile";
               const src = fs.readFileSync(p, "utf8");
-              const snippet = `post_install do |installer|\n    installer.pods_project.targets.each do |t|\n      t.build_configurations.each do |c|\n        c.build_settings["CODE_SIGNING_ALLOWED"] = "NO"\n        c.build_settings["CODE_SIGNING_REQUIRED"] = "NO"\n      end\n    end`;
+              const snippet = [
+                "post_install do |installer|",
+                "    installer.pods_project.targets.each do |t|",
+                "      t.build_configurations.each do |c|",
+                "        c.build_settings[\"CODE_SIGNING_ALLOWED\"] = \"NO\"",
+                "        c.build_settings[\"CODE_SIGNING_REQUIRED\"] = \"NO\"",
+                "      end",
+                "    end"
+              ].join("\n");
               if (!src.includes("post_install do |installer|")) {
                 throw new Error("Expected post_install block in generated Podfile");
               }
@@ -149,6 +143,7 @@ jobs:
           PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
           TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
         run: |
+          set -eo pipefail
           WORKSPACE=$(ls -d ios/*.xcworkspace | head -n 1)
           SCHEME=$(basename "$WORKSPACE" .xcworkspace)
           IPA_FILENAME="recipe-tracker-${{ steps.version.outputs.tag_name }}-b${{ steps.version.outputs.build_number }}.ipa"
@@ -166,8 +161,8 @@ jobs:
             security import cert.p12 -k build.keychain -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
             security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASS" build.keychain
 
-            mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
-            echo "$PROVISIONING_PROFILE_BASE64" | base64 --decode > ~/Library/MobileDevice/Provisioning\ Profiles/ci.mobileprovision
+            mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+            echo "$PROVISIONING_PROFILE_BASE64" | base64 --decode > "$HOME/Library/MobileDevice/Provisioning Profiles/ci.mobileprovision"
 
             xcodebuild archive \
               -workspace "$WORKSPACE" \
@@ -175,22 +170,25 @@ jobs:
               -configuration Release \
               -sdk iphoneos \
               -archivePath ios/build/App.xcarchive \
-              DEVELOPMENT_TEAM="$TEAM_ID"
+              DEVELOPMENT_TEAM="$TEAM_ID" 2>&1 | tee xcodebuild.log || {
+                grep -E "error:" xcodebuild.log | tail -n 15 | while IFS= read -r line; do echo "::error::$line"; done
+                exit 1
+              }
 
-            cat <<EOF > ios/ExportOptions.plist
-            <?xml version="1.0" encoding="UTF-8"?>
-            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-            <plist version="1.0">
-            <dict>
-              <key>method</key>
-              <string>ad-hoc</string>
-              <key>teamID</key>
-              <string>${TEAM_ID}</string>
-              <key>compileBitcode</key>
-              <false/>
-            </dict>
-            </plist>
-            EOF
+            node -e '
+              const fs = require("fs");
+              const teamId = process.env.TEAM_ID;
+              const plist = [
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+                "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">",
+                "<plist version=\"1.0\"><dict>",
+                "  <key>method</key><string>ad-hoc</string>",
+                "  <key>teamID</key><string>" + teamId + "</string>",
+                "  <key>compileBitcode</key><false/>",
+                "</dict></plist>"
+              ].join("\n");
+              fs.writeFileSync("ios/ExportOptions.plist", plist, "utf8");
+            '
 
             xcodebuild -exportArchive \
               -archivePath ios/build/App.xcarchive \
@@ -202,23 +200,27 @@ jobs:
             SIGNING_MODE="Signed (Ad-Hoc)"
 
             security delete-keychain build.keychain || true
-            rm -f cert.p12 ~/Library/MobileDevice/Provisioning\ Profiles/ci.mobileprovision
+            rm -f cert.p12 "$HOME/Library/MobileDevice/Provisioning Profiles/ci.mobileprovision"
           else
-            echo "Building native Release ARM64 .ipa (ready to sign & install with your Apple Dev account)..."
+            echo "Building native Release ARM64 .ipa..."
             xcodebuild build \
               -workspace "$WORKSPACE" \
               -scheme "$SCHEME" \
               -configuration Release \
               -sdk iphoneos \
+              -destination "generic/platform=iOS" \
               -derivedDataPath ios/build \
               CODE_SIGN_IDENTITY="" \
               EXPANDED_CODE_SIGN_IDENTITY="" \
               CODE_SIGNING_REQUIRED=NO \
-              CODE_SIGNING_ALLOWED=NO
+              CODE_SIGNING_ALLOWED=NO 2>&1 | tee xcodebuild.log || {
+                grep -E "error:|fatal error:" xcodebuild.log | tail -n 15 | while IFS= read -r line; do echo "::error::$line"; done
+                exit 1
+              }
 
             APP_PATH=$(find ios/build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -n 1)
             if [ -z "$APP_PATH" ] || [ ! -d "$APP_PATH" ]; then
-              echo "Error: Compiled .app bundle not found in Release-iphoneos"
+              echo "::error::Compiled .app bundle not found in ios/build/Build/Products/Release-iphoneos"
               exit 1
             fi
 
@@ -226,12 +228,28 @@ jobs:
             mkdir -p build_ipa/Payload
             cp -R "$APP_PATH" build_ipa/Payload/
             (cd build_ipa && zip -qry "../${IPA_FILENAME}" Payload)
-            SIGNING_MODE="Unsigned Release Binary (Sign with Apple Dev Account via Sideloadly / AltStore / SideStore / Xcode)"
+            SIGNING_MODE="Unsigned Release Binary (Sign & install with your Apple Dev Account via Sideloadly / AltStore / SideStore / Xcode)"
           fi
 
           ls -lh "${IPA_FILENAME}"
           echo "ipa_file=${IPA_FILENAME}" >> "$GITHUB_OUTPUT"
           echo "signing_mode=${SIGNING_MODE}" >> "$GITHUB_OUTPUT"
+
+      - name: Commit Version Bump & Push Release Tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if [ "${{ steps.version.outputs.needs_main_commit }}" = "true" ]; then
+            git add package.json app.json CHANGELOG.md
+            git commit -m "chore(release): ${{ steps.version.outputs.tag_name }} [skip ci]"
+            git push origin HEAD:main
+          fi
+
+          if [[ "${GITHUB_REF}" != refs/tags/v* ]]; then
+            git tag -f "${{ steps.version.outputs.tag_name }}"
+            git push -f origin "${{ steps.version.outputs.tag_name }}"
+          fi
 
       - name: Upload .ipa Build Artifact
         uses: actions/upload-artifact@v4
@@ -256,4 +274,4 @@ jobs:
             #### Installing on Your iPhone (from Windows with Your Apple Dev Account)
             1. Download **`${{ steps.build_ipa.outputs.ipa_file }}`** attached below.
             2. Open **Sideloadly** (or **AltStore / SideStore**) on Windows, connect your iPhone (USB or Wi-Fi), drop in the `.ipa`, sign in with your Apple Developer Apple ID, and click **Start** — with a paid Apple Developer account, the certificate stays valid for a full **365 days**!
-            *(Optional: Add `IOS_CERTIFICATE_P12_BASE64`, `IOS_CERTIFICATE_PASSWORD`, `IOS_PROVISIONING_PROFILE_BASE64`, and `IOS_TEAM_ID` in GitHub Actions Secrets to pre-sign `.ipa` builds in CI).*
+            *(Optional: Add `IOS_CERTIFICATE_P12_BASE64`, `IOS_CERTIFICATE_PASSWORD`, `IOS_PROVISIONING_PROFILE_BASE64`, and `IOS_TEAM_ID` in GitHub Actions Secrets to pre-sign `.ipa` builds directly in CI).*
