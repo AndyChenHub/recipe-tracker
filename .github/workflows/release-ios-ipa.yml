@@ -2,51 +2,45 @@ name: Build & Auto-Release iOS IPA
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*.*.*'
   workflow_dispatch:
     inputs:
-      profile:
-        description: 'iOS Distribution Profile (adhoc = direct installable .ipa, production = TestFlight/App Store)'
-        required: true
-        default: 'adhoc'
-        type: choice
-        options:
-          - adhoc
-          - production
       bump:
-        description: 'Optional automatic version bump before building (manual trigger only)'
+        description: 'Version bump before building (manual dispatch)'
         required: false
-        default: 'none'
+        default: 'patch'
         type: choice
         options:
-          - none
           - patch
           - minor
           - major
-      auto_submit_testflight:
-        description: 'Auto-submit to TestFlight (only applies when profile = production)'
-        required: false
-        default: false
-        type: boolean
+          - none
 
 permissions:
   contents: write
 
+concurrency:
+  group: ios-ipa-release
+  cancel-in-progress: false
+
 jobs:
   release-ios:
-    name: Compile Signed iOS IPA & Publish Release
-    runs-on: ubuntu-latest
+    name: Compile Native iOS IPA & Publish Release
+    if: github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[skip ci]')
+    runs-on: macos-26
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Setup Node.js
+      - name: Setup Node.js 24
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
 
       - name: Install dependencies
@@ -57,96 +51,209 @@ jobs:
           npm run typecheck
           npm test
 
-      - name: Optional Version Bump & Tag (Manual Dispatch)
-        if: github.event_name == 'workflow_dispatch' && inputs.bump != 'none'
+      - name: Auto-Version & Tag Release
+        id: version
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          node scripts/bump-version.mjs "${{ inputs.bump }}" --git
-          git push origin HEAD:main --follow-tags
 
-      - name: Determine Release Tag & Build Profile
-        id: meta
-        run: |
-          PKG_VER=$(node -p "require('./package.json').version")
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+          BUILD_NUMBER="${GITHUB_RUN_NUMBER}"
+
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             TAG_NAME="${GITHUB_REF_NAME}"
-          elif [[ "${{ inputs.bump }}" != "none" && -n "${{ inputs.bump }}" ]]; then
-            TAG_NAME="v${PKG_VER}"
+            APP_VERSION="${TAG_NAME#v}"
+            node scripts/bump-version.mjs "${APP_VERSION}"
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.bump }}" != "none" && -n "${{ inputs.bump }}" ]]; then
+            node scripts/bump-version.mjs "${{ inputs.bump }}"
+            APP_VERSION=$(node -p "require('./package.json').version")
+            TAG_NAME="v${APP_VERSION}"
+            git add package.json app.json CHANGELOG.md
+            git commit -m "chore(release): ${TAG_NAME} [skip ci]"
+            git tag -f "${TAG_NAME}"
+            git push origin HEAD:main
+            git push -f origin "${TAG_NAME}"
           else
-            TAG_NAME="v${PKG_VER}-build.${GITHUB_RUN_NUMBER}"
+            CURRENT_VER=$(node -p "require('./package.json').version")
+            if git ls-remote --tags origin "refs/tags/v${CURRENT_VER}" | grep -q .; then
+              node scripts/bump-version.mjs patch
+              APP_VERSION=$(node -p "require('./package.json').version")
+              TAG_NAME="v${APP_VERSION}"
+              git add package.json app.json CHANGELOG.md
+              git commit -m "chore(release): ${TAG_NAME} [skip ci]"
+              git tag -f "${TAG_NAME}"
+              git push origin HEAD:main
+              git push -f origin "${TAG_NAME}"
+            else
+              APP_VERSION="${CURRENT_VER}"
+              TAG_NAME="v${APP_VERSION}"
+              git tag -f "${TAG_NAME}"
+              git push -f origin "${TAG_NAME}"
+            fi
           fi
 
-          PROFILE="${{ inputs.profile || 'adhoc' }}"
-          SUBMIT_FLAG=""
-          if [[ "$PROFILE" == "production" && "${{ inputs.auto_submit_testflight }}" == "true" ]]; then
-            SUBMIT_FLAG="--auto-submit"
-          fi
-
+          echo "app_version=${APP_VERSION}" >> "$GITHUB_OUTPUT"
           echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
-          echo "pkg_version=${PKG_VER}" >> "$GITHUB_OUTPUT"
-          echo "profile=${PROFILE}" >> "$GITHUB_OUTPUT"
-          echo "submit_flag=${SUBMIT_FLAG}" >> "$GITHUB_OUTPUT"
+          echo "build_number=${BUILD_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "Resolved Release: ${TAG_NAME} (Build ${BUILD_NUMBER})"
 
-      - name: Setup Expo & EAS CLI
-        uses: expo/expo-github-action@v8
-        with:
-          eas-version: latest
-          token: ${{ secrets.EXPO_TOKEN }}
+      - name: Select Latest Xcode Toolchain
+        run: |
+          ls -d /Applications/Xcode*.app || true
+          LATEST_XCODE=$(ls -d /Applications/Xcode*.app 2>/dev/null | grep -vi beta | sort -V | tail -n 1 || true)
+          if [ -z "$LATEST_XCODE" ]; then
+            LATEST_XCODE=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -n 1 || true)
+          fi
+          if [ -n "$LATEST_XCODE" ]; then
+            sudo xcode-select -s "$LATEST_XCODE/Contents/Developer"
+          fi
+          xcodebuild -version
 
-      - name: Build Signed iOS .ipa on EAS Cloud
-        id: eas_build
+      - name: Generate Native iOS Project & Install CocoaPods
         env:
-          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
-          EAS_PROJECT_ID: ${{ secrets.EAS_PROJECT_ID }}
+          CI: '1'
+          IOS_BUILD_NUMBER: ${{ steps.version.outputs.build_number }}
           IOS_BUNDLE_IDENTIFIER: ${{ vars.IOS_BUNDLE_IDENTIFIER }}
           EXPO_PUBLIC_SUPABASE_URL: ${{ secrets.EXPO_PUBLIC_SUPABASE_URL }}
           EXPO_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.EXPO_PUBLIC_SUPABASE_ANON_KEY }}
           EXPO_PUBLIC_GEMINI_API_KEY: ${{ secrets.EXPO_PUBLIC_GEMINI_API_KEY }}
+          HAS_P12_CERT: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 != '' }}
         run: |
-          eas build \
-            --platform ios \
-            --profile "${{ steps.meta.outputs.profile }}" \
-            --non-interactive \
-            --json \
-            --wait \
-            ${{ steps.meta.outputs.submit_flag }} > eas-build-output.json
+          npx expo prebuild --platform ios --clean --no-install
 
-          node -e '
-            const fs = require("fs");
-            const raw = JSON.parse(fs.readFileSync("eas-build-output.json", "utf8"));
-            const build = Array.isArray(raw) ? raw[0] : raw;
-            if (!build || !build.artifacts || !build.artifacts.buildUrl) {
-              console.error("Missing IPA artifact URL in EAS response:", raw);
-              process.exit(1);
-            }
-            const out = [
-              `ipa_url=${build.artifacts.buildUrl}`,
-              `build_number=${build.appBuildVersion || "1"}`,
-              `app_version=${build.appVersion || "0.1.0"}`,
-              `details_url=${build.buildDetailsPageUrl || ""}`
-            ].join("\n");
-            fs.appendFileSync(process.env.GITHUB_OUTPUT, out + "\n");
-          '
+          # Ensure Xcode's JS bundle phase resolves Node 24 cleanly
+          echo "export NODE_BINARY=$(command -v node)" > ios/.xcode.env.local
 
-      - name: Download Compiled .ipa Artifact
-        id: download_ipa
+          # Relax pod resource bundle signing when compiling without a .p12 certificate in CI
+          if [ "$HAS_P12_CERT" != "true" ]; then
+            node -e '
+              const fs = require("fs");
+              const p = "ios/Podfile";
+              const src = fs.readFileSync(p, "utf8");
+              const snippet = `post_install do |installer|\n    installer.pods_project.targets.each do |t|\n      t.build_configurations.each do |c|\n        c.build_settings["CODE_SIGNING_ALLOWED"] = "NO"\n        c.build_settings["CODE_SIGNING_REQUIRED"] = "NO"\n      end\n    end`;
+              if (!src.includes("post_install do |installer|")) {
+                throw new Error("Expected post_install block in generated Podfile");
+              }
+              fs.writeFileSync(p, src.replace("post_install do |installer|", snippet));
+            '
+          fi
+
+          which pod || sudo gem install cocoapods --no-document
+          cd ios
+          pod install
+
+      - name: Compile Release iOS Binary & Package .ipa
+        id: build_ipa
+        env:
+          CERTIFICATE_P12_BASE64: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+          TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
         run: |
-          IPA_FILENAME="recipe-tracker-v${{ steps.eas_build.outputs.app_version }}-b${{ steps.eas_build.outputs.build_number }}-${{ steps.meta.outputs.profile }}.ipa"
-          curl -fsSL "${{ steps.eas_build.outputs.ipa_url }}" -o "${IPA_FILENAME}"
+          WORKSPACE=$(ls -d ios/*.xcworkspace | head -n 1)
+          SCHEME=$(basename "$WORKSPACE" .xcworkspace)
+          IPA_FILENAME="recipe-tracker-${{ steps.version.outputs.tag_name }}-b${{ steps.version.outputs.build_number }}.ipa"
+          echo "Building workspace=$WORKSPACE scheme=$SCHEME -> $IPA_FILENAME"
+
+          if [ -n "$CERTIFICATE_P12_BASE64" ] && [ -n "$PROVISIONING_PROFILE_BASE64" ] && [ -n "$TEAM_ID" ]; then
+            echo "Apple signing secrets detected — building signed Ad-Hoc .ipa..."
+            KEYCHAIN_PASS="ci_temp_keychain_pass_987"
+            security create-keychain -p "$KEYCHAIN_PASS" build.keychain
+            security default-keychain -s build.keychain
+            security unlock-keychain -p "$KEYCHAIN_PASS" build.keychain
+            security set-keychain-settings -t 3600 -l build.keychain
+
+            echo "$CERTIFICATE_P12_BASE64" | base64 --decode > cert.p12
+            security import cert.p12 -k build.keychain -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+            security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASS" build.keychain
+
+            mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+            echo "$PROVISIONING_PROFILE_BASE64" | base64 --decode > ~/Library/MobileDevice/Provisioning\ Profiles/ci.mobileprovision
+
+            xcodebuild archive \
+              -workspace "$WORKSPACE" \
+              -scheme "$SCHEME" \
+              -configuration Release \
+              -sdk iphoneos \
+              -archivePath ios/build/App.xcarchive \
+              DEVELOPMENT_TEAM="$TEAM_ID"
+
+            cat <<EOF > ios/ExportOptions.plist
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0">
+            <dict>
+              <key>method</key>
+              <string>ad-hoc</string>
+              <key>teamID</key>
+              <string>${TEAM_ID}</string>
+              <key>compileBitcode</key>
+              <false/>
+            </dict>
+            </plist>
+            EOF
+
+            xcodebuild -exportArchive \
+              -archivePath ios/build/App.xcarchive \
+              -exportPath ios/build/export \
+              -exportOptionsPlist ios/ExportOptions.plist
+
+            EXPORTED_IPA=$(ls ios/build/export/*.ipa | head -n 1)
+            cp "$EXPORTED_IPA" "./${IPA_FILENAME}"
+            SIGNING_MODE="Signed (Ad-Hoc)"
+
+            security delete-keychain build.keychain || true
+            rm -f cert.p12 ~/Library/MobileDevice/Provisioning\ Profiles/ci.mobileprovision
+          else
+            echo "Building native Release ARM64 .ipa (ready to sign & install with your Apple Dev account)..."
+            xcodebuild build \
+              -workspace "$WORKSPACE" \
+              -scheme "$SCHEME" \
+              -configuration Release \
+              -sdk iphoneos \
+              -derivedDataPath ios/build \
+              CODE_SIGN_IDENTITY="" \
+              EXPANDED_CODE_SIGN_IDENTITY="" \
+              CODE_SIGNING_REQUIRED=NO \
+              CODE_SIGNING_ALLOWED=NO
+
+            APP_PATH=$(find ios/build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -n 1)
+            if [ -z "$APP_PATH" ] || [ ! -d "$APP_PATH" ]; then
+              echo "Error: Compiled .app bundle not found in Release-iphoneos"
+              exit 1
+            fi
+
+            rm -rf build_ipa
+            mkdir -p build_ipa/Payload
+            cp -R "$APP_PATH" build_ipa/Payload/
+            (cd build_ipa && zip -qry "../${IPA_FILENAME}" Payload)
+            SIGNING_MODE="Unsigned Release Binary (Sign with Apple Dev Account via Sideloadly / AltStore / SideStore / Xcode)"
+          fi
+
           ls -lh "${IPA_FILENAME}"
           echo "ipa_file=${IPA_FILENAME}" >> "$GITHUB_OUTPUT"
+          echo "signing_mode=${SIGNING_MODE}" >> "$GITHUB_OUTPUT"
 
-      - name: Publish GitHub Release with Attached .ipa
+      - name: Upload .ipa Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.build_ipa.outputs.ipa_file }}
+          path: ${{ steps.build_ipa.outputs.ipa_file }}
+          retention-days: 30
+
+      - name: Publish GitHub Release with .ipa
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.meta.outputs.tag_name }}
-          name: "Recipe Tracker iOS ${{ steps.meta.outputs.tag_name }} (Build ${{ steps.eas_build.outputs.build_number }})"
+          tag_name: ${{ steps.version.outputs.tag_name }}
+          name: "Recipe Tracker iOS ${{ steps.version.outputs.tag_name }} (Build ${{ steps.version.outputs.build_number }})"
           generate_release_notes: true
-          files: ${{ steps.download_ipa.outputs.ipa_file }}
+          files: ${{ steps.build_ipa.outputs.ipa_file }}
           body: |
-            ### 📱 iOS Build Ready (`${{ steps.meta.outputs.profile }}`)
-            - **Semantic Version:** `v${{ steps.eas_build.outputs.app_version }}`
-            - **iOS Build Number (`CFBundleVersion`):** `${{ steps.eas_build.outputs.build_number }}`
-            - **OTA Install / QR Page (EAS):** ${{ steps.eas_build.outputs.details_url }}
-            - **Direct `.ipa` Binary:** Attached below (`${{ steps.download_ipa.outputs.ipa_file }}`) — install over-the-air via the EAS link above, Apple Configurator, or Xcode Devices.
+            ### 📱 Recipe Tracker iOS Release `${{ steps.version.outputs.tag_name }}`
+            - **Version:** `v${{ steps.version.outputs.app_version }}`
+            - **iOS Build (`CFBundleVersion`):** `${{ steps.version.outputs.build_number }}`
+            - **Package Mode:** ${{ steps.build_ipa.outputs.signing_mode }}
+
+            #### Installing on Your iPhone (from Windows with Your Apple Dev Account)
+            1. Download **`${{ steps.build_ipa.outputs.ipa_file }}`** attached below.
+            2. Open **Sideloadly** (or **AltStore / SideStore**) on Windows, connect your iPhone (USB or Wi-Fi), drop in the `.ipa`, sign in with your Apple Developer Apple ID, and click **Start** — with a paid Apple Developer account, the certificate stays valid for a full **365 days**!
+            *(Optional: Add `IOS_CERTIFICATE_P12_BASE64`, `IOS_CERTIFICATE_PASSWORD`, `IOS_PROVISIONING_PROFILE_BASE64`, and `IOS_TEAM_ID` in GitHub Actions Secrets to pre-sign `.ipa` builds in CI).*

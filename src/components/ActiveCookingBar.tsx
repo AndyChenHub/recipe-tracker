@@ -1,6 +1,7 @@
 import { useRouter } from 'expo-router';
 import React from 'react';
 import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useAppStore } from '@/src/store/AppContext';
 
 function formatClock(totalSeconds: number): string {
@@ -13,8 +14,9 @@ function formatClock(totalSeconds: number): string {
 /**
  * Paprika-style dark bottom utility bar for Pinned Active Recipes & Countdown Timers.
  */
-export function ActiveCookingBar() {
+export function ActiveCookingBar({ withBottomInset = false }: { withBottomInset?: boolean }) {
   const router = useRouter();
+  const insets = useSafeAreaInsets();
   const {
     timers,
     cookingSessions,
@@ -33,7 +35,11 @@ export function ActiveCookingBar() {
   const now = Date.now();
 
   return (
-    <View style={styles.bar}>
+    <View
+      style={[
+        styles.bar,
+        withBottomInset && { paddingBottom: Math.max(8, insets.bottom) },
+      ]}>
       {timers.map((t) => {
         const remaining =
           t.isRunning && t.endsAtMs
@@ -42,9 +48,7 @@ export function ActiveCookingBar() {
         const isDone = remaining === 0;
 
         return (
-          <View
-            key={t.id}
-            style={[styles.timerStrip, isDone && styles.timerStripDone]}>
+          <View key={t.id} style={[styles.timerStrip, isDone && styles.timerStripDone]}>
             <Pressable
               style={styles.timerInfo}
               onPress={() => router.push(`/recipe/${t.recipeId}` as never)}>

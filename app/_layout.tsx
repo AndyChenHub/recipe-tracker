@@ -1,10 +1,9 @@
 import { useFonts } from 'expo-font';
 import * as Linking from 'expo-linking';
 import { DarkTheme, DefaultTheme, Stack, ThemeProvider, useRouter } from 'expo-router';
-import { ShareIntentProvider, useShareIntentContext } from 'expo-share-intent';
 import * as SplashScreen from 'expo-splash-screen';
 import { StatusBar } from 'expo-status-bar';
-import React, { useEffect } from 'react';
+import React, { useEffect, useRef } from 'react';
 import 'react-native-reanimated';
 
 import { useColorScheme } from '@/components/useColorScheme';
@@ -19,33 +18,42 @@ export const unstable_settings = {
 
 SplashScreen.preventAutoHideAsync();
 
-function ShareSheetBridge() {
-  const router = useRouter();
-  const { hasShareIntent, shareIntent, resetShareIntent } = useShareIntentContext();
-
-  useEffect(() => {
-    if (!hasShareIntent) return;
-    const sharedText = shareIntent.webUrl || shareIntent.text || '';
-    if (sharedText) {
-      resetShareIntent();
-      router.push({
-        pathname: '/(tabs)/import',
-        params: { shared: sharedText },
-      });
+function extractSharedTargetFromDeepLink(rawUrl: string): string | null {
+  try {
+    const parsed = Linking.parse(rawUrl);
+    const paramUrl = parsed.queryParams?.url ?? parsed.queryParams?.shared ?? parsed.queryParams?.text;
+    if (typeof paramUrl === 'string' && paramUrl.trim().length > 0) {
+      return paramUrl.trim();
     }
-  }, [hasShareIntent, shareIntent, resetShareIntent, router]);
+  } catch {
+    // Ignore malformed URLs
+  }
+  return null;
+}
+
+/**
+ * Handles both cold-start and warm-resume deep links from the iOS Share Sheet Shortcut:
+ * e.g. recipetracker://import?url=https://www.tiktok.com/...
+ */
+function DeepLinkShareBridge() {
+  const router = useRouter();
+  const lastHandledRef = useRef<string | null>(null);
 
   useEffect(() => {
-    const sub = Linking.addEventListener('url', ({ url }) => {
-      const parsed = Linking.parse(url);
-      const target = parsed.queryParams?.url;
-      if (typeof target === 'string' && target.length > 0) {
+    const routeIncoming = (incomingUrl: string | null) => {
+      if (!incomingUrl || lastHandledRef.current === incomingUrl) return;
+      const sharedTarget = extractSharedTargetFromDeepLink(incomingUrl);
+      if (sharedTarget) {
+        lastHandledRef.current = incomingUrl;
         router.push({
           pathname: '/(tabs)/import',
-          params: { shared: target },
+          params: { shared: sharedTarget },
         });
       }
-    });
+    };
+
+    Linking.getInitialURL().then(routeIncoming).catch(() => {});
+    const sub = Linking.addEventListener('url', ({ url }) => routeIncoming(url));
     return () => sub.remove();
   }, [router]);
 
@@ -72,11 +80,9 @@ export default function RootLayout() {
   }
 
   return (
-    <ShareIntentProvider>
-      <AppProvider>
-        <RootLayoutNav />
-      </AppProvider>
-    </ShareIntentProvider>
+    <AppProvider>
+      <RootLayoutNav />
+    </AppProvider>
   );
 }
 
@@ -86,9 +92,8 @@ function RootLayoutNav() {
 
   return (
     <ThemeProvider value={scheme === 'dark' ? DarkTheme : DefaultTheme}>
-      {/* Paprika uses white status-bar text/icons against its solid spice-orange header */}
       <StatusBar style="light" />
-      <ShareSheetBridge />
+      <DeepLinkShareBridge />
       <Stack
         screenOptions={{
           headerStyle: { backgroundColor: palette.headerBg },

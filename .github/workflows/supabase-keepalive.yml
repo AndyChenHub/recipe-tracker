@@ -2,7 +2,7 @@ name: Supabase Free-Tier Keepalive
 
 on:
   schedule:
-    # Runs every 5 days at 04:00 UTC so the free-tier Supabase database never auto-pauses
+    # Runs every 5 days at 04:00 UTC so a connected free-tier Supabase database never auto-pauses
     - cron: '0 4 */5 * *'
   workflow_dispatch:
 
@@ -10,10 +10,16 @@ jobs:
   ping:
     name: Ping Supabase REST Endpoint
     runs-on: ubuntu-latest
-    if: ${{ secrets.EXPO_PUBLIC_SUPABASE_URL != '' && secrets.EXPO_PUBLIC_SUPABASE_ANON_KEY != '' }}
     steps:
-      - name: Query recipes count
+      - name: Query recipes endpoint if configured
+        env:
+          SUPABASE_URL: ${{ secrets.EXPO_PUBLIC_SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.EXPO_PUBLIC_SUPABASE_ANON_KEY }}
         run: |
-          curl -fsSL "${{ secrets.EXPO_PUBLIC_SUPABASE_URL }}/rest/v1/recipes?select=id&limit=1" \
-            -H "apikey: ${{ secrets.EXPO_PUBLIC_SUPABASE_ANON_KEY }}" \
-            -H "Authorization: Bearer ${{ secrets.EXPO_PUBLIC_SUPABASE_ANON_KEY }}"
+          if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_ANON_KEY" ]; then
+            echo "Supabase secrets are not configured in GitHub Secrets yet — skipping keepalive ping."
+            exit 0
+          fi
+          curl -fsSL "${SUPABASE_URL}/rest/v1/recipes?select=id&limit=1" \
+            -H "apikey: ${SUPABASE_ANON_KEY}" \
+            -H "Authorization: Bearer ${SUPABASE_ANON_KEY}"

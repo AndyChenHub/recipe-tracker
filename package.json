@@ -13,7 +13,6 @@
     "expo-keep-awake": "~58.0.4",
     "expo-linking": "~58.0.17",
     "expo-router": "~58.0.31",
-    "expo-share-intent": "^9.0.0",
     "expo-splash-screen": "~58.0.14",
     "expo-status-bar": "~58.0.5",
     "expo-symbols": "~58.0.5",
@@ -29,6 +28,8 @@
     "react-native-worklets": "0.13.0"
   },
   "devDependencies": {
+    "@emnapi/core": "^2.0.0-beta.2",
+    "@emnapi/runtime": "^2.0.0-beta.2",
     "@types/node": "^26.6.6",
     "@types/react": "~19.3.0",
     "typescript": "~6.0.3",

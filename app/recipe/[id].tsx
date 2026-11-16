@@ -1,10 +1,12 @@
 import { useKeepAwake } from 'expo-keep-awake';
 import * as Linking from 'expo-linking';
 import { Stack, useLocalSearchParams, useRouter } from 'expo-router';
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   Alert,
+  KeyboardAvoidingView,
   Modal,
+  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -64,6 +66,11 @@ export default function PaprikaRecipeDetailScreen() {
   const [editingNotes, setEditingNotes] = useState(false);
   const [draftNotes, setDraftNotes] = useState(recipe?.notes ?? '');
   const [toastMsg, setToastMsg] = useState<string | null>(null);
+
+  useEffect(() => {
+    setEditingNotes(false);
+    setDraftNotes(recipe?.notes ?? '');
+  }, [recipe?.id, recipe?.notes]);
 
   if (!recipe) {
     return (
@@ -236,7 +243,9 @@ export default function PaprikaRecipeDetailScreen() {
   );
 
   return (
-    <View style={[styles.screen, { backgroundColor: palette.paperBg }]}>
+    <KeyboardAvoidingView
+      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      style={[styles.screen, { backgroundColor: palette.paperBg }]}>
       <Stack.Screen
         options={{
           title: '',
@@ -425,7 +434,7 @@ export default function PaprikaRecipeDetailScreen() {
         </View>
       </ScrollView>
 
-      <ActiveCookingBar />
+      <ActiveCookingBar withBottomInset />
 
       {/* Paprika "Scale & Convert" Popover Modal */}
       <Modal
@@ -581,7 +590,7 @@ export default function PaprikaRecipeDetailScreen() {
           </ScrollView>
         </View>
       </Modal>
-    </View>
+    </KeyboardAvoidingView>
   );
 }
 

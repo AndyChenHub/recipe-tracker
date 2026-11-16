@@ -11,7 +11,7 @@ function getGitShortSha(): string {
       .toString()
       .trim();
   } catch {
-    return 'uncommitted';
+    return 'local';
   }
 }
 
@@ -21,6 +21,11 @@ export default ({ config }: ConfigContext): ExpoConfig => {
     config.ios?.bundleIdentifier ||
     'com.chena.recipetracker';
 
+  const buildNumber =
+    process.env.IOS_BUILD_NUMBER ||
+    config.ios?.buildNumber ||
+    '1';
+
   const easProjectId =
     process.env.EAS_PROJECT_ID ||
     (config.extra?.eas as { projectId?: string } | undefined)?.projectId;
@@ -29,15 +34,14 @@ export default ({ config }: ConfigContext): ExpoConfig => {
     ...config,
     name: config.name ?? 'Recipe Tracker',
     slug: config.slug ?? 'recipe-tracker',
-    // Single source of truth for SemVer across package.json & native iOS CFBundleShortVersionString
     version: pkg.version,
     ios: {
       ...config.ios,
       supportsTablet: true,
       bundleIdentifier: bundleId,
+      buildNumber: String(buildNumber),
       infoPlist: {
         ...config.ios?.infoPlist,
-        // Skips manual Export Compliance prompt in App Store Connect / TestFlight
         ITSAppUsesNonExemptEncryption: false,
       },
     },
@@ -49,7 +53,7 @@ export default ({ config }: ConfigContext): ExpoConfig => {
       ...config.extra,
       gitCommitSha: getGitShortSha(),
       buildTimestamp: new Date().toISOString(),
-      releaseChannel: process.env.EAS_BUILD_PROFILE ?? 'development',
+      releaseChannel: process.env.EAS_BUILD_PROFILE ?? (process.env.CI ? 'release' : 'development'),
       ...(easProjectId
         ? {
             eas: {
